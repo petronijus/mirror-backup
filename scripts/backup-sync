@@ -327,7 +327,12 @@ fi
 
 if [[ "$ARCHIVE_DAYS" -gt 0 ]]; then
     ARCHIVE_DIR="$DST/.archive/$(date +%Y-%m-%d_%H%M%S)"
-    RSYNC_ARGS+=(--backup "--backup-dir=$ARCHIVE_DIR")
+    # The archive lives inside the destination, so rsync sees it as extraneous.
+    # Without this exclude it does not delete it — it *backs it up*, moving the
+    # previous archive into the new one and nesting them one level deeper every
+    # run (backup-secondary reached four levels before this was spotted, and the
+    # maxdepth-1 pruning below could never reach the buried ones).
+    RSYNC_ARGS+=(--backup "--backup-dir=$ARCHIVE_DIR" --exclude=/.archive/)
 fi
 
 # --- optional rsync features (env vars set by systemd service) ---
@@ -416,7 +421,10 @@ wait "$RSYNC_PID" 2>/dev/null || RSYNC_EXIT=$?
 # --- archive cleanup ---
 
 if [[ "$ARCHIVE_DAYS" -gt 0 && -d "$DST/.archive" ]]; then
-    find "$DST/.archive" -maxdepth 1 -type d -mtime "+$ARCHIVE_DAYS" -exec rm -rf {} + 2>/dev/null || true
+    # gio trash cannot be used here: this runs unattended, the destination may be
+    # a NAS mount, and an expired archive is by definition already a second copy.
+    find "$DST/.archive" -mindepth 1 -maxdepth 1 -type d -mtime "+$ARCHIVE_DAYS" \
+        -exec rm -rf {} + 2>/dev/null || true
     rmdir "$DST/.archive" 2>/dev/null || true
 fi
 
