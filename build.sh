@@ -34,6 +34,10 @@ cp "$SCRIPT_DIR/data/com.github.petronijus.BackupMonitor.desktop" "$EXT_BUILD/da
 mkdir -p "$EXT_BUILD/scripts"
 cp "$SCRIPT_DIR/scripts/backup-sync" "$EXT_BUILD/scripts/"
 
+# Bundle the resume unit (installed and enabled by the extension on first run)
+mkdir -p "$EXT_BUILD/systemd"
+cp "$SCRIPT_DIR/systemd/mirror-backup-resume.service" "$EXT_BUILD/systemd/"
+
 # Bundle config templates
 mkdir -p "$EXT_BUILD/config"
 cp "$SCRIPT_DIR"/config/* "$EXT_BUILD/config/" 2>/dev/null || true

@@ -1,8 +1,62 @@
 #!/usr/bin/env bash
 # backup-sync — rsync wrapper with progress tracking and desktop notifications
 # Usage: backup-sync <job-name> <src> <dst> [exclude-file] [archive-days]
+#        backup-sync --resume-deferred
+#
+# A run cut short by suspend, shutdown or logout is postponed, not failed:
+# suspend stops rsync and runs it again after wake, shutdown/logout leave a
+# <job>.deferred marker that `--resume-deferred` (mirror-backup-resume.service,
+# once per user-manager start) turns back into a run.
 
 set -euo pipefail
+
+STATUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/status"
+LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/logs"
+HISTORY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/history"
+mkdir -p "$STATUS_DIR" "$LOG_DIR" "$HISTORY_DIR"
+
+# Start every job whose last run did not get to finish: postponed ones (a
+# .deferred marker) and ones killed without warning — power loss, hard reset,
+# a hung kernel — whose status file still says active but predates this boot.
+resume_deferred() {
+    local boot_epoch marker status_file job state updated updated_epoch
+    local -A pending=()
+    boot_epoch=$(awk '/^btime / {print $2}' /proc/stat)
+    shopt -s nullglob
+
+    for marker in "$STATUS_DIR"/*.deferred; do
+        pending["$(basename "$marker" .deferred)"]="postponed"
+    done
+
+    for status_file in "$STATUS_DIR"/*.json; do
+        job=$(basename "$status_file" .json)
+        state=$(grep -oP '"state":\s*"\K[^"]+' "$status_file" 2>/dev/null) || continue
+        case "$state" in
+            running|scanning|paused|queued) ;;
+            *) continue ;;
+        esac
+        updated=$(grep -oP '"updated":\s*"\K[^"]+' "$status_file" 2>/dev/null) || continue
+        updated_epoch=$(date -d "$updated" +%s 2>/dev/null) || continue
+        if (( updated_epoch < boot_epoch )); then
+            pending["$job"]="interrupted"
+        fi
+    done
+
+    for job in "${!pending[@]}"; do
+        if [[ "$(systemctl --user show -P LoadState "$job.service" 2>/dev/null)" != loaded ]]; then
+            echo "$job: unit no longer exists, dropping its ${pending[$job]} run"
+            rm -f "$STATUS_DIR/$job.deferred"
+            continue
+        fi
+        echo "$job: restarting ${pending[$job]} run"
+        systemctl --user start --no-block "$job.service"
+    done
+}
+
+if [[ "${1:-}" == "--resume-deferred" ]]; then
+    resume_deferred
+    exit 0
+fi
 
 JOB_NAME="${1:?Usage: backup-sync <job-name> <src> <dst> [exclude-file] [archive-days]}"
 SRC="${2:?Missing source path}"
@@ -10,18 +64,28 @@ DST="${3:?Missing destination path}"
 EXCLUDE_FILE="${4:-}"
 ARCHIVE_DAYS="${5:-0}"
 
-STATUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/status"
-LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/logs"
-HISTORY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/history"
-mkdir -p "$STATUS_DIR" "$LOG_DIR" "$HISTORY_DIR"
-
 STATUS_FILE="$STATUS_DIR/$JOB_NAME.json"
 PID_FILE="$STATUS_DIR/$JOB_NAME.pid"
 LOG_FILE="$LOG_DIR/$JOB_NAME.log"
 PROGRESS_FILE="$STATUS_DIR/$JOB_NAME.progress"
 LOCK_FILE="$STATUS_DIR/backup-sync.lock"
+DEFERRED_FILE="$STATUS_DIR/$JOB_NAME.deferred"
+
+# logind endpoint the suspend guard listens to. Overridable only so the
+# suspend path can be exercised against a fake logind on the session bus.
+LOGIND_BUS="${BACKUP_SYNC_LOGIND_BUS:-system}"
+LOGIND_NAME="${BACKUP_SYNC_LOGIND_NAME:-org.freedesktop.login1}"
+RSYNC_STOP_GRACE="${BACKUP_SYNC_STOP_GRACE:-10}"   # seconds between SIGTERM and SIGKILL
 
 RSYNC_PID=""
+PRUNE_PID=""
+FLOCK_PID=""
+INHIBIT_PID=""
+SLEEP_GUARD=0      # 1 while the logind signal monitor (coprocess SLEEP_MON) runs
+SLEEP_EVENT=""     # "start" / "end" after wait_tick saw PrepareForSleep
+DEFERRED=0
+DEFER_REASON=""    # "suspend" or "shutdown"
+WAS_PAUSED=0       # rsync was paused when a suspend stopped it
 LAST_PCT=0
 LAST_SPEED=""
 LAST_ETA=""
@@ -94,6 +158,7 @@ write_status() {
   "src": "$SRC",
   "dst": "$DST",
   "error": "$escaped_error",
+  "deferred_reason": "${DEFER_REASON:-}",
   "consecutive_failures": ${CONSECUTIVE_FAILURES:-0},
   "suggested_excludes": ${SUGGESTED_EXCLUDES_JSON:-[]}
 }
@@ -238,37 +303,312 @@ truncate_progress_file() {
     fi
 }
 
-# --- signal handlers ---
+# --- stopping rsync / postponing the run ---
 
-pause_handler() {
-    if [[ -n "$RSYNC_PID" ]] && kill -0 "$RSYNC_PID" 2>/dev/null; then
-        kill -STOP "$RSYNC_PID" 2>/dev/null || true
-        IS_PAUSED=1
-        write_status "paused"
-        notify "⏸ $JOB_NAME" "Backup paused"
+descendants() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        echo "$child"
+        descendants "$child"
+    done
+}
+
+# "pid:starttime" for $1 and every process below it. The start time pins the
+# identity, so a PID the kernel hands out again is never mistaken for ours.
+proc_tree() {
+    local pid stat fields
+    for pid in "$1" $(descendants "$1"); do
+        { stat=$(< "/proc/$pid/stat"); } 2>/dev/null || continue
+        read -ra fields <<< "${stat##*) }"   # fields after "(comm) "
+        echo "$pid:${fields[19]}"
+    done
+}
+
+# Any process of a proc_tree snapshot still alive?
+tree_alive() {
+    local entry pid stat fields
+    for entry in "$@"; do
+        pid="${entry%%:*}"
+        { stat=$(< "/proc/$pid/stat"); } 2>/dev/null || continue
+        read -ra fields <<< "${stat##*) }"
+        [[ "${fields[19]}" == "${entry#*:}" && "${fields[0]}" != Z ]] && return 0
+    done
+    return 1
+}
+
+# Stop background child $1 and everything it forked (a local rsync transfer
+# is a sender, receiver and generator trio), and wait until all of them are
+# gone — for a suspend, any survivor could still be inside a FUSE request.
+# SIGTERM first so rsync removes its temp files; SIGCONT because a paused
+# (SIGSTOPped) rsync cannot act on anything; SIGKILL for whatever is still
+# there after the grace period.
+stop_tree() {
+    local root="$1" entry waited=0
+    local -a tree=() pids=()
+    [[ -n "$root" ]] && kill -0 "$root" 2>/dev/null || return 0
+    mapfile -t tree < <(proc_tree "$root")
+    for entry in "${tree[@]}"; do pids+=("${entry%%:*}"); done
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    kill -CONT "${pids[@]}" 2>/dev/null || true
+    while tree_alive "${tree[@]}" && (( waited < RSYNC_STOP_GRACE * 10 )); do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    for entry in "${tree[@]}"; do
+        tree_alive "$entry" && kill -KILL "${entry%%:*}" 2>/dev/null
+    done
+    wait "$root" 2>/dev/null || true
+}
+
+stop_rsync() {
+    stop_tree "$RSYNC_PID"
+    IS_PAUSED=0
+}
+
+# True while the user's service manager or the whole system is going down —
+# shutdown, reboot, or logout of a user without lingering. A SIGTERM arriving
+# then is not somebody pressing Stop, so the run is postponed instead of failed.
+session_stopping() {
+    local scope state
+    for scope in --user --system; do
+        state=$(timeout 5 systemctl "$scope" is-system-running 2>/dev/null) || true
+        [[ "$state" == stopping ]] && return 0
+    done
+    return 1
+}
+
+defer() {
+    DEFERRED=1
+    DEFER_REASON="$1"
+    printf '{"reason": "%s", "since": "%s"}\n' "$1" "$(date -Iseconds)" > "$DEFERRED_FILE"
+}
+
+# --- suspend guard ---
+#
+# rsync blocked inside a FUSE request (NTFS via ntfs-3g, rclone, sshfs …)
+# cannot be frozen for suspend: the freezer stops the FUSE daemon as well, the
+# request never completes, and after 20 s the kernel aborts the suspend. So
+# while rsync runs we hold a logind *delay* inhibitor. logind announces the
+# suspend with PrepareForSleep(true) and waits for us; the FUSE daemon is still
+# running at that point, the pending request completes, rsync exits, and only
+# then is the inhibitor released. After PrepareForSleep(false) the run starts
+# over. Needs gdbus and systemd-inhibit; without them the guard stays off.
+
+start_sleep_guard() {
+    command -v gdbus >/dev/null && command -v systemd-inhibit >/dev/null \
+        && command -v stdbuf >/dev/null || return 0
+    coproc SLEEP_MON {
+        exec stdbuf -oL gdbus monitor "--$LOGIND_BUS" --dest "$LOGIND_NAME" \
+            --object-path /org/freedesktop/login1 2>/dev/null 9>&-
+    }
+    # gdbus prints the owner line once its match rule is in place; taking the
+    # inhibitor any earlier could hold up a suspend whose signal we then miss.
+    local line
+    while [[ -n "${SLEEP_MON[0]:-}" ]] && IFS= read -r -t 5 -u "${SLEEP_MON[0]}" line; do
+        if [[ "$line" == "The name $LOGIND_NAME is owned by "* ]]; then
+            SLEEP_GUARD=1
+            return 0
+        fi
+    done
+    stop_sleep_guard
+}
+
+stop_sleep_guard() {
+    release_inhibitor
+    if [[ -n "${SLEEP_MON_PID:-}" ]]; then
+        kill "$SLEEP_MON_PID" 2>/dev/null || true
+        wait "$SLEEP_MON_PID" 2>/dev/null || true
+    fi
+    SLEEP_GUARD=0
+}
+
+acquire_inhibitor() {
+    (( SLEEP_GUARD )) && [[ -z "$INHIBIT_PID" ]] || return 0
+    systemd-inhibit --what=sleep --mode=delay --who="Mirror Backup" \
+        --why="Stopping $JOB_NAME before suspend" sleep infinity 9>&- &
+    INHIBIT_PID=$!
+}
+
+release_inhibitor() {
+    [[ -n "$INHIBIT_PID" ]] || return 0
+    kill "$INHIBIT_PID" 2>/dev/null || true
+    wait "$INHIBIT_PID" 2>/dev/null || true
+    INHIBIT_PID=""
+}
+
+# Wait up to $1 seconds (default 2) — the status-refresh tick — and report a
+# logind sleep transition in SLEEP_EVENT. A trapped signal does not cut
+# `read -t` short, so the tick also bounds how long a stop request waits.
+wait_tick() {
+    local timeout="${1:-2}" line rc=0
+    SLEEP_EVENT=""
+    # bash drops the SLEEP_MON array once the coprocess has exited.
+    if (( SLEEP_GUARD )) && [[ -z "${SLEEP_MON[0]:-}" ]]; then
+        stop_sleep_guard
+    fi
+    if (( SLEEP_GUARD )); then
+        IFS= read -r -t "$timeout" -u "${SLEEP_MON[0]}" line || rc=$?
+        if (( rc == 0 )); then
+            case "$line" in
+                *".PrepareForSleep (true,)"*)  SLEEP_EVENT="start" ;;
+                *".PrepareForSleep (false,)"*) SLEEP_EVENT="end" ;;
+            esac
+            return 0
+        fi
+        (( rc > 128 )) && return 0    # timed out, or a trapped signal
+        stop_sleep_guard              # EOF: the monitor died, fall back to polling
+    fi
+    sleep "$timeout" &
+    wait $! 2>/dev/null || true
+}
+
+# Networked source or destination (NFS, SMB, sshfs, rclone …)? Decided from
+# the mount table alone, so a server that is still unreachable cannot hang it.
+on_network_fs() {
+    local path fstype
+    for path in "$SRC" "$DST"; do
+        fstype=$(findmnt -n -o FSTYPE --target "$path" 2>/dev/null) || continue
+        case "$fstype" in
+            nfs|nfs4|cifs|smb3|ceph|glusterfs|9p|fuse.sshfs|fuse.rclone|fuse.s3fs|fuse.gcsfuse)
+                return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Let the announced suspend proceed and return once the system is back.
+wait_for_wake() {
+    release_inhibitor
+    until [[ "$SLEEP_EVENT" == "end" ]] || (( ! SLEEP_GUARD )); do
+        wait_tick   # short ticks keep a Stop during the wait responsive
+        handle_signals
+    done
+    # Right after wake the network is typically still reconnecting.
+    if on_network_fs && command -v nm-online >/dev/null; then
+        nm-online -q -t 60 || true
     fi
 }
 
-resume_handler() {
-    if [[ -n "$RSYNC_PID" ]] && kill -0 "$RSYNC_PID" 2>/dev/null; then
-        kill -CONT "$RSYNC_PID" 2>/dev/null || true
-        IS_PAUSED=0
-        write_status "running"
-        notify "▶ $JOB_NAME" "Backup resumed"
+# Watch background child $1 until it exits, running $2 every tick. Returns 1
+# as soon as a suspend is announced (the caller then stops the child), 0 once
+# the child has finished on its own.
+supervise() {
+    local pid="$1" on_tick="$2"
+    while kill -0 "$pid" 2>/dev/null; do
+        "$on_tick"
+        wait_tick
+        handle_signals
+        [[ "$SLEEP_EVENT" == "start" ]] && return 1
+    done
+    return 0
+}
+
+no_tick() { :; }
+
+# rsync was cut short by an announced suspend. Even a paused one is stopped:
+# rsync's pieces are not guaranteed to be parked outside a FUSE request.
+stop_rsync_for_suspend() {
+    WAS_PAUSED=$IS_PAUSED
+    stop_rsync
+    rm -f "$PROGRESS_FILE"
+    defer suspend   # the marker survives a machine that never wakes (hibernate, power off)
+    write_status "deferred"
+    echo "=== $(date -Iseconds) === stopped for suspend, restarts after wake ===" >> "$LOG_FILE"
+    notify "⏸ $JOB_NAME" "Stopped for suspend — restarts after wake"
+    wait_for_wake
+    rm -f "$DEFERRED_FILE"
+    DEFERRED=0
+    DEFER_REASON=""
+}
+
+# --- signal handlers ---
+#
+# Traps only record what arrived; the work happens at the checkpoints in the
+# main flow (handle_signals). A trap runs *inside* whatever builtin it
+# interrupted, and when that is `read -t` — the suspend guard's tick — a
+# handler that outlives the read's timeout makes bash longjmp into a dead
+# stack frame and abort.
+
+TERM_REQUESTED=0
+PAUSE_REQUEST=""   # "pause" / "resume", the latest one wins
+
+# The whole rsync tree: stopping only the sender would leave the receiver and
+# generator running, and possibly sitting in a FUSE request.
+pause_rsync() {
+    [[ -n "$RSYNC_PID" ]] && kill -0 "$RSYNC_PID" 2>/dev/null || return 0
+    # shellcheck disable=SC2046
+    kill -STOP "$RSYNC_PID" $(descendants "$RSYNC_PID") 2>/dev/null || true
+    IS_PAUSED=1
+    write_status "paused"
+}
+
+resume_rsync() {
+    [[ -n "$RSYNC_PID" ]] && kill -0 "$RSYNC_PID" 2>/dev/null || return 0
+    # shellcheck disable=SC2046
+    kill -CONT "$RSYNC_PID" $(descendants "$RSYNC_PID") 2>/dev/null || true
+    IS_PAUSED=0
+    write_status "running"
+}
+
+handle_signals() {
+    if (( TERM_REQUESTED )); then
+        on_terminate
     fi
+    case "$PAUSE_REQUEST" in
+        pause)
+            if (( ! IS_PAUSED )) && [[ -n "$RSYNC_PID" ]] && kill -0 "$RSYNC_PID" 2>/dev/null; then
+                pause_rsync
+                notify "⏸ $JOB_NAME" "Backup paused"
+            fi
+            ;;
+        resume)
+            if (( IS_PAUSED )) && [[ -n "$RSYNC_PID" ]] && kill -0 "$RSYNC_PID" 2>/dev/null; then
+                resume_rsync
+                notify "▶ $JOB_NAME" "Backup resumed"
+            fi
+            ;;
+    esac
+    PAUSE_REQUEST=""
+}
+
+# SIGTERM / SIGINT / SIGHUP, acted on from handle_signals.
+on_terminate() {
+    trap '' TERM INT HUP
+    if [[ -n "$FLOCK_PID" ]]; then
+        kill "$FLOCK_PID" 2>/dev/null || true
+    fi
+    stop_rsync
+    stop_tree "$PRUNE_PID"
+    if session_stopping; then
+        defer shutdown
+    else
+        # A deliberate stop cancels the run, including one waiting out a suspend.
+        rm -f "$DEFERRED_FILE"
+        DEFERRED=0
+        DEFER_REASON=""
+    fi
+    exit 143
 }
 
 cleanup() {
+    stop_rsync
+    stop_tree "$PRUNE_PID"
+    stop_sleep_guard
     rm -f "$PID_FILE" "$PROGRESS_FILE" "${PROGRESS_FILE}.tmp" "${STATUS_FILE}.tmp"
-    if [[ "$FINISHED" -eq 0 ]]; then
+    if (( DEFERRED )); then
+        write_status "deferred"
+        echo "=== $(date -Iseconds) === postponed by $DEFER_REASON, restarts at next start ===" >> "$LOG_FILE"
+        # No notification: the desktop session is going away with us.
+    elif [[ "$FINISHED" -eq 0 ]]; then
         ERROR_MSG="Backup interrupted"
         write_status "error"
         notify "⏹ $JOB_NAME" "Backup interrupted"
     fi
 }
 
-trap pause_handler SIGUSR1
-trap resume_handler SIGUSR2
+trap 'PAUSE_REQUEST=pause' USR1
+trap 'PAUSE_REQUEST=resume' USR2
+trap 'TERM_REQUESTED=1' TERM INT HUP
 trap cleanup EXIT
 
 # --- preflight checks ---
@@ -288,11 +628,35 @@ fi
 # --- job queue: wait for exclusive lock ---
 # Only one backup runs at a time. Others wait in FIFO order.
 
+# This run supersedes any postponed one; a failed preflight above keeps the
+# marker so the next start tries again.
+rm -f "$DEFERRED_FILE"
+
 exec 9>"$LOCK_FILE"
 if ! flock -n 9 2>/dev/null; then
     write_status "queued"
     notify "⏳ $JOB_NAME" "Waiting for another backup to finish"
-    flock 9  # blocking wait
+    # Blocking wait in the background: a foreground command would hold off the
+    # SIGTERM trap until the lock came free. The lock belongs to the open file
+    # description, which the child shares with us, so it outlives the child.
+    flock 9 &
+    FLOCK_PID=$!
+    while :; do
+        FLOCK_RC=0
+        wait "$FLOCK_PID" 2>/dev/null || FLOCK_RC=$?
+        handle_signals
+        # >128 with flock still alive: a trapped signal cut the wait short
+        (( FLOCK_RC > 128 )) && kill -0 "$FLOCK_PID" 2>/dev/null && continue
+        break
+    done
+    FLOCK_PID=""
+    if (( FLOCK_RC != 0 )); then
+        ERROR_MSG="Could not acquire the job queue lock (flock exit $FLOCK_RC)"
+        write_status "error"
+        notify "✖ $JOB_NAME" "$ERROR_MSG"
+        FINISHED=1
+        exit 1
+    fi
 fi
 # Lock acquired — reset start time to now (excludes queue wait)
 START_TIME="$(date -Iseconds)"
@@ -381,33 +745,51 @@ fi
 
 # --- go ---
 
-echo "$$ " > "$PID_FILE"
-write_status "scanning"
-notify "🔄 $JOB_NAME" "$SRC → $DST"
-
-echo "=== $(date -Iseconds) === $JOB_NAME: $SRC → $DST ===" >> "$LOG_FILE"
-
-rm -f "$PROGRESS_FILE"
-rsync "${RSYNC_ARGS[@]}" "$SRC" "$DST" \
-    > >(stdbuf -oL tr '\r' '\n' > "$PROGRESS_FILE") \
-    2>> "$LOG_FILE" &
-RSYNC_PID=$!
-echo "$$ $RSYNC_PID" > "$PID_FILE"
-
-while kill -0 "$RSYNC_PID" 2>/dev/null; do
-    if [[ "$IS_PAUSED" -eq 0 ]]; then
-        if parse_progress; then
-            SEEN_PROGRESS=1
-            write_status "running"
-        elif [[ "$SEEN_PROGRESS" -eq 0 ]]; then
-            if [[ -r "/proc/$RSYNC_PID/io" ]]; then
-                SCAN_READ=$(format_bytes "$(awk '/^read_bytes:/ {print $2}' "/proc/$RSYNC_PID/io" 2>/dev/null || echo 0)")
-            fi
-            write_status "scanning"
+# Every tick while rsync runs: turn its progress output into the status file.
+rsync_tick() {
+    [[ "$IS_PAUSED" -eq 0 ]] || return 0
+    if parse_progress; then
+        SEEN_PROGRESS=1
+        write_status "running"
+    elif [[ "$SEEN_PROGRESS" -eq 0 ]]; then
+        if [[ -r "/proc/$RSYNC_PID/io" ]]; then
+            SCAN_READ=$(format_bytes "$(awk '/^read_bytes:/ {print $2}' "/proc/$RSYNC_PID/io" 2>/dev/null || echo 0)")
         fi
-        truncate_progress_file
+        write_status "scanning"
     fi
-    sleep 2 || true
+    truncate_progress_file
+}
+
+echo "$$ " > "$PID_FILE"
+notify "🔄 $JOB_NAME" "$SRC → $DST"
+start_sleep_guard
+
+while :; do
+    LAST_PCT=0 LAST_SPEED="" LAST_ETA="" CURRENT_FILE="" SCAN_READ=""
+    FILES_XFRD=0 FILES_TOTAL=0 FILES_REMAINING=0 SEEN_PROGRESS=0
+    write_status "scanning"
+    echo "=== $START_TIME === $JOB_NAME: $SRC → $DST ===" >> "$LOG_FILE"
+
+    rm -f "$PROGRESS_FILE"
+    rsync "${RSYNC_ARGS[@]}" "$SRC" "$DST" \
+        > >(stdbuf -oL tr '\r' '\n' > "$PROGRESS_FILE") \
+        2>> "$LOG_FILE" &
+    RSYNC_PID=$!
+    echo "$$ $RSYNC_PID" > "$PID_FILE"
+    acquire_inhibitor
+    if (( WAS_PAUSED )); then
+        pause_rsync   # the user's pause outlives the suspend
+        WAS_PAUSED=0
+    fi
+
+    supervise "$RSYNC_PID" rsync_tick && break
+
+    stop_rsync_for_suspend
+    # Start over rather than resume: rsync needs a fresh file list anyway, and
+    # the pass after wake is what the history entry and the log should show.
+    START_TIME="$(date -Iseconds)"
+    START_EPOCH="$(date +%s)"
+    notify "🔄 $JOB_NAME" "Restarting after wake"
 done
 
 # Read any remaining output after rsync exits
@@ -420,13 +802,28 @@ wait "$RSYNC_PID" 2>/dev/null || RSYNC_EXIT=$?
 
 # --- archive cleanup ---
 
-if [[ "$ARCHIVE_DAYS" -gt 0 && -d "$DST/.archive" ]]; then
+prune_archive() {
     # gio trash cannot be used here: this runs unattended, the destination may be
     # a NAS mount, and an expired archive is by definition already a second copy.
     find "$DST/.archive" -mindepth 1 -maxdepth 1 -type d -mtime "+$ARCHIVE_DAYS" \
         -exec rm -rf {} + 2>/dev/null || true
     rmdir "$DST/.archive" 2>/dev/null || true
+}
+
+if [[ "$ARCHIVE_DAYS" -gt 0 && -d "$DST/.archive" ]]; then
+    # The destination can be a FUSE mount too, so pruning runs under the same
+    # suspend guard; stopped halfway, it simply runs again after wake.
+    while :; do
+        prune_archive &
+        PRUNE_PID=$!
+        supervise "$PRUNE_PID" no_tick && break
+        stop_tree "$PRUNE_PID"
+        wait_for_wake
+        acquire_inhibitor
+    done
+    PRUNE_PID=""
 fi
+stop_sleep_guard
 
 # --- finish: classify outcome ---
 

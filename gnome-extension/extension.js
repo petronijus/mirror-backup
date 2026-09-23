@@ -264,6 +264,7 @@ class BackupJobSection {
             scanning: 'Scanning',
             running: 'Syncing',
             paused: 'Paused',
+            deferred: 'Postponed',
             error: 'Error',
         };
         const isSuccess = state === 'idle' && (status?.progress ?? 0) >= 100;
@@ -344,8 +345,12 @@ class BackupJobSection {
             this._errorLabel.visible = false;
         }
 
-        // countdown
-        if (!isActive && !isQueued && this._nextRunIso) {
+        // countdown, or when a postponed run restarts
+        if (state === 'deferred') {
+            this._countdownLabel.text = status?.deferred_reason === 'suspend'
+                ? 'Restarts after wake' : 'Restarts at next start';
+            this._countdownLabel.visible = true;
+        } else if (!isActive && !isQueued && this._nextRunIso) {
             const cd = _formatCountdown(this._nextRunIso);
             this._countdownLabel.text = cd ? `Next ${cd}` : '';
             this._countdownLabel.visible = !!cd;
@@ -533,6 +538,36 @@ export default class BackupMonitorExtension extends Extension {
             }
         } catch (_e) {
             // Already exists or no bundled script — fine
+        }
+
+        // Install and enable the unit that restarts postponed backups at the
+        // next start. Bundled in release zips only; install.sh does it itself.
+        try {
+            const unitName = 'mirror-backup-resume.service';
+            const unitSrc = Gio.File.new_for_path(
+                GLib.build_filenamev([extDir, 'systemd', unitName]));
+            if (unitSrc.query_exists(null)) {
+                const unitDir = GLib.build_filenamev([home, '.config', 'systemd', 'user']);
+                const unitDst = Gio.File.new_for_path(
+                    GLib.build_filenamev([unitDir, unitName]));
+                const wanted = Gio.File.new_for_path(
+                    GLib.build_filenamev([unitDir, 'default.target.wants', unitName]));
+                const decoder = new TextDecoder();
+                const [, srcBytes] = unitSrc.load_contents(null);
+                let current = false;
+                if (unitDst.query_exists(null)) {
+                    const [, dstBytes] = unitDst.load_contents(null);
+                    current = decoder.decode(srcBytes) === decoder.decode(dstBytes);
+                }
+                if (!current || !wanted.query_exists(null)) {
+                    GLib.mkdir_with_parents(unitDir, 0o755);
+                    unitSrc.copy(unitDst, Gio.FileCopyFlags.OVERWRITE, null, null);
+                    _runSystemctlAsync(['daemon-reload'],
+                        () => _runSystemctlAsync(['enable', unitName]));
+                }
+            }
+        } catch (e) {
+            log(`[BackupMonitor] Failed to install mirror-backup-resume.service: ${e.message}`);
         }
 
         // Install .desktop file for the app launcher

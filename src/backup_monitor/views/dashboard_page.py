@@ -100,6 +100,7 @@ class DashboardPage(Gtk.Box):
         """Refresh all job cards and the summary."""
         active = 0
         queued = 0
+        postponed = 0
         errors = 0
 
         for card in self._cards:
@@ -109,6 +110,8 @@ class DashboardPage(Gtk.Box):
                 active += 1
             elif state == 'queued':
                 queued += 1
+            elif state == 'deferred':
+                postponed += 1
             elif state == 'error':
                 errors += 1
 
@@ -117,6 +120,8 @@ class DashboardPage(Gtk.Box):
             parts.append(f'{active} active')
         if queued:
             parts.append(f'{queued} queued')
+        if postponed:
+            parts.append(f'{postponed} postponed')
         if errors:
             parts.append(f'{errors} error{"s" if errors > 1 else ""}')
         self._summary_label.set_label(', '.join(parts) if parts else 'All idle')

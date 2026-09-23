@@ -55,6 +55,14 @@ else
     echo "Create your backup jobs in the desktop app after install."
 fi
 
+# 5. Unit that restarts backups postponed by a shutdown or cut short by a crash
+echo "Installing mirror-backup-resume.service..."
+install -Dm644 "$SCRIPT_DIR/systemd/mirror-backup-resume.service" \
+    "$HOME/.config/systemd/user/mirror-backup-resume.service"
+systemctl --user daemon-reload
+systemctl --user enable mirror-backup-resume.service
+echo "  ✔ mirror-backup-resume.service enabled"
+
 # 6. GNOME extension (includes bundled desktop app)
 echo "Installing GNOME Shell extension + desktop app..."
 mkdir -p "$EXT_DIR"

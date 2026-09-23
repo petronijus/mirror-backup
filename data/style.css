@@ -27,6 +27,7 @@
 .bm-dot-scanning,
 .bm-dot-running { color: @accent_color; }
 .bm-dot-paused { color: @warning_color; }
+.bm-dot-deferred { color: alpha(@accent_color, 0.55); }
 .bm-dot-success { color: @success_color; }
 .bm-dot-error { color: @error_color; }
 
@@ -58,6 +59,11 @@
 .bm-state-paused {
     color: @warning_color;
     background: alpha(@warning_color, 0.12);
+}
+
+.bm-state-deferred {
+    color: alpha(@accent_color, 0.75);
+    background: alpha(@accent_color, 0.08);
 }
 
 .bm-state-success {

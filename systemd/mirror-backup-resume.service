@@ -1,0 +1,12 @@
+# Once per start of the user's service manager (boot, or login without
+# lingering): start every backup job that a shutdown, logout, crash or power
+# loss cut short. See `backup-sync --resume-deferred`.
+[Unit]
+Description=Mirror Backup: restart backups interrupted by shutdown or crash
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/backup-sync --resume-deferred
+
+[Install]
+WantedBy=default.target

@@ -218,6 +218,7 @@ class JobCard(Gtk.Box):
             'scanning': 'Scanning',
             'running': 'Syncing',
             'paused': 'Paused',
+            'deferred': 'Postponed',
             'error': 'Error',
         }
         badge_text = state_names.get(state, state)
@@ -228,8 +229,8 @@ class JobCard(Gtk.Box):
 
         # Update CSS classes for state badge
         for cls in ['bm-state-idle', 'bm-state-queued', 'bm-state-running',
-                     'bm-state-scanning', 'bm-state-paused', 'bm-state-error',
-                     'bm-state-success']:
+                     'bm-state-scanning', 'bm-state-paused', 'bm-state-deferred',
+                     'bm-state-error', 'bm-state-success']:
             self._state_badge.remove_css_class(cls)
 
         if is_success:
@@ -239,8 +240,8 @@ class JobCard(Gtk.Box):
 
         # Dot color
         for cls in ['bm-dot-idle', 'bm-dot-queued', 'bm-dot-running',
-                     'bm-dot-scanning', 'bm-dot-paused', 'bm-dot-error',
-                     'bm-dot-success']:
+                     'bm-dot-scanning', 'bm-dot-paused', 'bm-dot-deferred',
+                     'bm-dot-error', 'bm-dot-success']:
             self._dot.remove_css_class(cls)
 
         if is_success:
@@ -287,7 +288,10 @@ class JobCard(Gtk.Box):
         # Schedule info — live countdown
         countdown = format_countdown(self._job.next_run)
         last = format_relative_past(self._job.last_run)
-        self._next_run_label.set_label(f'Next: {countdown}' if countdown else '')
+        if state == 'deferred':
+            self._next_run_label.set_label(st.deferred_note)
+        else:
+            self._next_run_label.set_label(f'Next: {countdown}' if countdown else '')
         self._last_run_label.set_label(f'Last: {last}' if last else '')
 
         # Error

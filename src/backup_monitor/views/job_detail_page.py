@@ -73,9 +73,12 @@ class JobDetailPage(Adw.NavigationPage):
         st = self._job.status
         state_display = {
             'idle': 'Idle', 'queued': 'Queued', 'scanning': 'Scanning',
-            'running': 'Syncing', 'paused': 'Paused', 'error': 'Error',
+            'running': 'Syncing', 'paused': 'Paused', 'deferred': 'Postponed',
+            'error': 'Error',
         }
         status_group.add(self._info_row('State', state_display.get(st.state, st.state)))
+        if st.state == 'deferred':
+            status_group.add(self._info_row('Postponed', st.deferred_note))
 
         if self._job.next_run:
             from backup_monitor.services.systemd_service import format_countdown

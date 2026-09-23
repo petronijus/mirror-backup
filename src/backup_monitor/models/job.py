@@ -32,6 +32,14 @@ class BackupStatus:
     destination: str = ''
     consecutive_failures: int = 0
     suggested_excludes: list[str] = field(default_factory=list)
+    deferred_reason: str = ''  # 'suspend' or 'shutdown' while state == 'deferred'
+
+    @property
+    def deferred_note(self) -> str:
+        """When a postponed run is going to start again."""
+        if self.deferred_reason == 'suspend':
+            return 'Restarts after wake'
+        return 'Restarts at next start'
 
 
 @dataclass
@@ -75,6 +83,7 @@ class BackupJob:
                 destination=data.get('destination', ''),
                 consecutive_failures=int(data.get('consecutive_failures', 0)),
                 suggested_excludes=list(data.get('suggested_excludes', [])),
+                deferred_reason=data.get('deferred_reason', ''),
             )
             # Validate PID liveness for active states
             if st.state in ('running', 'scanning', 'paused', 'queued') and not _is_alive(st.pid):
