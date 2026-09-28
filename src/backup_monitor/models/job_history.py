@@ -1,13 +1,13 @@
-"""Job history model — reads JSONL history files written by backup-sync."""
+"""Job history model — reads the JSONL history backup-sync keeps in each
+job's destination (``<destination>/.mirror-backup/history.jsonl``)."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
-HISTORY_DIR = Path.home() / '.local' / 'share' / 'backup-sync' / 'history'
+from backup_monitor import paths
 
 
 @dataclass
@@ -19,6 +19,7 @@ class HistoryEntry:
     files_transferred: int
     files_total: int
     error: str
+    host: str = ''   # machine the run happened on; empty for pre-0.6 entries
 
     @property
     def success(self) -> bool:
@@ -37,10 +38,12 @@ class HistoryEntry:
 
     @property
     def started_datetime(self) -> datetime | None:
+        """Start in naive local time (the history stores it with an offset)."""
         try:
-            return datetime.fromisoformat(self.started)
+            dt = datetime.fromisoformat(self.started)
         except (ValueError, TypeError):
             return None
+        return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
 
     @property
     def started_relative(self) -> str:
@@ -87,9 +90,9 @@ class HistoryStats:
         return f'{h}h {m}m'
 
 
-def read_history(job_id: str, limit: int = 50) -> list[HistoryEntry]:
-    """Read history entries for a job, newest first."""
-    path = HISTORY_DIR / f'{job_id}.jsonl'
+def read_history(destination: str, limit: int = 50) -> list[HistoryEntry]:
+    """Read history entries of the job mirroring into ``destination``, newest first."""
+    path = paths.job_paths(destination).history
     if not path.is_file():
         return []
 
@@ -109,15 +112,22 @@ def read_history(job_id: str, limit: int = 50) -> list[HistoryEntry]:
                     files_transferred=data.get('files_transferred', 0),
                     files_total=data.get('files_total', 0),
                     error=data.get('error', ''),
+                    host=data.get('host', ''),
                 ))
             except json.JSONDecodeError:
                 continue
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
 
     # Newest first
     entries.reverse()
     return entries[:limit]
+
+
+def last_run(destination: str) -> HistoryEntry | None:
+    """The most recent run of the job, on whichever machine it happened."""
+    entries = read_history(destination, limit=1)
+    return entries[0] if entries else None
 
 
 def compute_stats(entries: list[HistoryEntry]) -> HistoryStats:

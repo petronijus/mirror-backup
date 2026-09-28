@@ -120,6 +120,16 @@ def _parse_systemd_timestamp(systemd_ts: str) -> str:
     return ''
 
 
+def local_datetime(iso_ts: str) -> datetime:
+    """Parse an ISO 8601 timestamp into naive local time, whether or not it
+    carries an offset — backup-sync writes one (date -Iseconds), systemd
+    timestamps parsed above do not, and the two must compare with now()."""
+    dt = datetime.fromisoformat(iso_ts)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
 def format_countdown(iso_ts: str) -> str:
     """Format an ISO timestamp as a countdown string like '2h 15m' or 'in 3d 5h'.
 
@@ -128,7 +138,7 @@ def format_countdown(iso_ts: str) -> str:
     if not iso_ts:
         return ''
     try:
-        dt = datetime.fromisoformat(iso_ts)
+        dt = local_datetime(iso_ts)
         now = datetime.now()
         diff = dt - now
         total_sec = int(diff.total_seconds())
@@ -156,7 +166,7 @@ def format_relative_past(iso_ts: str) -> str:
     if not iso_ts:
         return ''
     try:
-        dt = datetime.fromisoformat(iso_ts)
+        dt = local_datetime(iso_ts)
         now = datetime.now()
         diff = now - dt
         total_sec = int(diff.total_seconds())

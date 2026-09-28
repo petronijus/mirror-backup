@@ -22,7 +22,8 @@ mkdir -p "$EXT_BUILD"
 # Extension core files
 cp "$SCRIPT_DIR"/gnome-extension/* "$EXT_BUILD/"
 
-# Bundle the desktop app
+# Bundle the desktop app (the extension copies it to ~/.local/share/mirror-backup
+# on its first run, where the mirror-backup command expects it)
 cp -r "$SCRIPT_DIR/src" "$EXT_BUILD/app"
 
 # Bundle data (CSS, desktop file)
@@ -32,7 +33,7 @@ cp "$SCRIPT_DIR/data/com.github.petronijus.BackupMonitor.desktop" "$EXT_BUILD/da
 
 # Bundle backup-sync script
 mkdir -p "$EXT_BUILD/scripts"
-cp "$SCRIPT_DIR/scripts/backup-sync" "$EXT_BUILD/scripts/"
+cp "$SCRIPT_DIR/scripts/backup-sync" "$SCRIPT_DIR/scripts/mirror-backup" "$EXT_BUILD/scripts/"
 
 # Bundle the resume unit (installed and enabled by the extension on first run)
 mkdir -p "$EXT_BUILD/systemd"

@@ -2,7 +2,10 @@
   "uuid": "backup-monitor@petronijus",
   "name": "Mirror Backup for GNOME",
   "description": "Scheduled rsync mirroring with a live panel indicator and a desktop app.",
-  "shell-version": ["49", "50"],
-  "version": 8,
+  "shell-version": [
+    "49",
+    "50"
+  ],
+  "version": 9,
   "url": "https://github.com/petronijus/mirror-backup-gnome"
 }

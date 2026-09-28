@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# mirror-backup — the Mirror Backup app, or one of its commands:
+#
+#   mirror-backup                    open the app
+#   mirror-backup status [--json]    every job's state (what the panel widgets show)
+#   mirror-backup sync-units         make the systemd units match jobs.json
+#   mirror-backup resume             restart postponed and interrupted runs
+#   mirror-backup migrate-legacy     move pre-0.6 state into the destinations
+#
+# The app lives in ${XDG_DATA_HOME:-~/.local/share}/mirror-backup/app — put
+# there by install.sh, or by the GNOME extension on its first run.
+set -euo pipefail
+APP_DIR="${MIRROR_BACKUP_APP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mirror-backup/app}"
+if [[ ! -d "$APP_DIR/backup_monitor" ]]; then
+    echo "mirror-backup: the app is not installed in $APP_DIR (run install.sh)" >&2
+    exit 1
+fi
+PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m backup_monitor "$@"

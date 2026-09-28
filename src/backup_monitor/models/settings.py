@@ -1,11 +1,11 @@
-"""Global app settings — stored as JSON in ~/.config/backup-sync/settings.json."""
+"""Global app settings — stored as JSON in the config dir's settings.json."""
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-SETTINGS_FILE = Path.home() / '.config' / 'backup-sync' / 'settings.json'
+from backup_monitor import paths
+from backup_monitor.fsutil import atomic_write_text
 
 DEFAULTS = {
     'notifications': {
@@ -29,17 +29,17 @@ class Settings:
         self._load()
 
     def _load(self):
-        if SETTINGS_FILE.is_file():
+        settings_file = paths.settings_file()
+        if settings_file.is_file():
             try:
-                self._data = json.loads(SETTINGS_FILE.read_text())
+                self._data = json.loads(settings_file.read_text())
             except (json.JSONDecodeError, OSError):
                 self._data = {}
         else:
             self._data = {}
 
     def _save(self):
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(self._data, indent=2) + '\n')
+        atomic_write_text(paths.settings_file(), json.dumps(self._data, indent=2) + '\n')
 
     def get(self, key: str, default=None):
         """Get a setting value, falling back to DEFAULTS then default."""

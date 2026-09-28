@@ -10,7 +10,6 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gio, Pango
 
 
-LOG_DIR = Path.home() / '.local' / 'share' / 'backup-sync' / 'logs'
 
 
 class LogViewerPage(Adw.NavigationPage):
@@ -18,10 +17,9 @@ class LogViewerPage(Adw.NavigationPage):
 
     __gtype_name__ = 'LogViewerPage'
 
-    def __init__(self, job_id: str, job_name: str):
+    def __init__(self, job_name: str, log_path: Path):
         super().__init__(title=f'{job_name} Log')
-        self._job_id = job_id
-        self._log_path = LOG_DIR / f'{job_id}.log'
+        self._log_path = log_path
         self._file_monitor = None
 
         # Layout

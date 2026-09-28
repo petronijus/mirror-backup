@@ -12,7 +12,7 @@ artifacts:
 registry:
   images: []
 preflight_extra:
-  - bash -n install.sh build.sh uninstall.sh scripts/backup-sync
+  - tests/run.sh
 notes: |
   metadata.json "version" is the e.g.o integer — bump it manually whenever
   gnome-extension/ or the bundled app changes.

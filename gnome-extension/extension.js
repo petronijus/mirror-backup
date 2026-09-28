@@ -8,12 +8,19 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const JOBS_FILE = GLib.build_filenamev([
-    GLib.get_home_dir(), '.config', 'backup-sync', 'jobs.json',
-]);
+const HOME = GLib.get_home_dir();
+const JOBS_FILE = GLib.build_filenamev([HOME, '.config', 'backup-sync', 'jobs.json']);
+const BIN_DIR = GLib.build_filenamev([HOME, '.local', 'bin']);
+const MIRROR_BACKUP = GLib.build_filenamev([BIN_DIR, 'mirror-backup']);
+const APP_HOME = GLib.build_filenamev([GLib.get_user_data_dir(), 'mirror-backup']);
+
+// Poll `mirror-backup status` this often (seconds): quickly while a backup
+// runs, lazily otherwise. Opening the menu always asks at once.
+const POLL_ACTIVE_S = 3;
+const POLL_IDLE_S = 15;
 
 // Read the user's jobs from jobs.json (the same source the desktop app uses)
-// so the panel reflects their actual backup jobs rather than a fixed list.
+// so the menu can be built before the first status arrives.
 function _loadJobs() {
     try {
         const [ok, contents] = GLib.file_get_contents(JOBS_FILE);
@@ -21,15 +28,11 @@ function _loadJobs() {
         const data = JSON.parse(new TextDecoder().decode(contents));
         return (data.jobs ?? [])
             .filter(j => j && j.id)
-            .map(j => ({id: j.id, label: j.name ?? j.id, service: `${j.id}.service`}));
+            .map(j => ({id: j.id, name: j.name ?? j.id, service: `${j.id}.service`}));
     } catch (_e) {
         return [];
     }
 }
-
-const STATUS_DIR = GLib.build_filenamev([
-    GLib.get_home_dir(), '.local', 'share', 'backup-sync', 'status',
-]);
 
 function _runSystemctlAsync(args, callback) {
     try {
@@ -51,77 +54,71 @@ function _runSystemctlAsync(args, callback) {
     }
 }
 
-function _isBackupAlive(pid) {
-    if (!pid || pid <= 0) return false;
+// Every job's state, as `mirror-backup status --json` reports it. The rules
+// for where a job's state lives (its destination) and when a run counts as
+// alive are the app's; the panel only displays the result.
+function _fetchSnapshot(cancellable, callback) {
     try {
-        const [ok, data] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
-        if (!ok) return false;
-        return new TextDecoder().decode(data).includes('backup-sync');
-    } catch (_e) {
-        return false;
+        const proc = Gio.Subprocess.new(
+            [MIRROR_BACKUP, 'status', '--json'],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        );
+        proc.communicate_utf8_async(null, cancellable, (_proc, res) => {
+            try {
+                const [, stdout, stderr] = _proc.communicate_utf8_finish(res);
+                if (!_proc.get_successful()) {
+                    callback(null, stderr?.trim() || 'mirror-backup status failed');
+                    return;
+                }
+                callback(JSON.parse(stdout), null);
+            } catch (e) {
+                if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    callback(null, e.message);
+            }
+        });
+    } catch (e) {
+        callback(null, `mirror-backup not available: ${e.message}`);
     }
 }
 
 function _formatCountdown(isoTimestamp) {
-    try {
-        const target = new Date(isoTimestamp).getTime();
-        if (isNaN(target)) return '';
-        const now = Date.now();
-        let sec = Math.floor((target - now) / 1000);
-        if (sec <= 0) return 'now';
+    const target = new Date(isoTimestamp).getTime();
+    if (isNaN(target)) return '';
+    const sec = Math.floor((target - Date.now()) / 1000);
+    if (sec <= 0) return 'now';
 
-        const days = Math.floor(sec / 86400);
-        const hours = Math.floor((sec % 86400) / 3600);
-        const minutes = Math.floor((sec % 3600) / 60);
+    const days = Math.floor(sec / 86400);
+    const hours = Math.floor((sec % 86400) / 3600);
+    const minutes = Math.floor((sec % 3600) / 60);
 
-        if (days > 0) return `in ${days}d ${hours}h`;
-        if (hours > 0) return `in ${hours}h ${minutes}m`;
-        if (minutes > 0) return `in ${minutes}m`;
-        return `in ${sec}s`;
-    } catch (_e) {
-        return '';
-    }
+    if (days > 0) return `in ${days}d ${hours}h`;
+    if (hours > 0) return `in ${hours}h ${minutes}m`;
+    if (minutes > 0) return `in ${minutes}m`;
+    return `in ${sec}s`;
 }
 
-function _parseSystemdTimestamp(ts) {
-    // "Thu 2026-03-27 18:00:00 CET" → ISO string
-    const parts = ts.split(/\s+/);
-    if (parts.length >= 3)
-        return `${parts[1]}T${parts[2]}`;
-    return '';
-}
-
-function _readStatusFile(jobId) {
-    const path = GLib.build_filenamev([STATUS_DIR, `${jobId}.json`]);
-    try {
-        const [ok, contents] = GLib.file_get_contents(path);
-        if (!ok) return null;
-        const status = JSON.parse(new TextDecoder().decode(contents));
-
-        const st = status.state;
-        if ((st === 'running' || st === 'scanning' || st === 'paused' || st === 'queued')
-            && !_isBackupAlive(status.pid)) {
-            status.state = 'idle';
-            status.progress = 0;
-            status.speed = '';
-            status.eta = '';
-            status.current_file = '';
-            status.error = '';
-        }
-
-        return status;
-    } catch (_e) {
-        // Missing or invalid — normal for first run
-    }
-    return null;
+function _formatRelativePast(isoTimestamp) {
+    const then = new Date(isoTimestamp);
+    if (isNaN(then.getTime())) return '';
+    const sec = Math.floor((Date.now() - then.getTime()) / 1000);
+    const clock = `${String(then.getHours()).padStart(2, '0')}:${String(then.getMinutes()).padStart(2, '0')}`;
+    if (sec < 0) return clock;
+    if (sec < 60) return 'just now';
+    const now = new Date();
+    const dayOf = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const days = Math.round((dayOf(now) - dayOf(then)) / 86400000);
+    if (days <= 0)
+        return sec < 3600 ? `${Math.floor(sec / 60)}m ago` : `${Math.floor(sec / 3600)}h ago`;
+    if (days === 1) return `yesterday ${clock}`;
+    if (days < 7) return `${then.toLocaleDateString('en-US', {weekday: 'short'})} ${clock}`;
+    return then.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
 }
 
 class BackupJobSection {
     constructor(job, menu) {
         this._job = job;
         this._paused = false;
-        this._status = null;
-        this._nextRunIso = '';  // ISO timestamp for countdown
+        this._snap = null;
 
         this._item = new PopupMenu.PopupBaseMenuItem({
             reactive: false,
@@ -149,7 +146,7 @@ class BackupJobSection {
         this._headerRow.add_child(this._dot);
 
         this._nameLabel = new St.Label({
-            text: job.label,
+            text: job.name,
             x_expand: true,
             style_class: 'bm-name',
         });
@@ -213,7 +210,7 @@ class BackupJobSection {
         this._box.add_child(this._errorLabel);
         this._errorLabel.visible = false;
 
-        // ── countdown row ──
+        // ── schedule row: next run · last run (on whichever machine) ──
         this._countdownLabel = new St.Label({
             text: '',
             style_class: 'bm-detail bm-countdown',
@@ -235,8 +232,13 @@ class BackupJobSection {
         this._btnRow.add_child(this._stopBtn);
         this._box.add_child(this._btnRow);
 
+        this._separator = new PopupMenu.PopupSeparatorMenuItem();
         menu.addMenuItem(this._item);
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        menu.addMenuItem(this._separator);
+    }
+
+    get state() {
+        return this._snap?.status?.state ?? 'idle';
     }
 
     _iconButton(iconName, callback) {
@@ -252,10 +254,11 @@ class BackupJobSection {
         return btn;
     }
 
-    update() {
-        const status = _readStatusFile(this._job.id);
-        this._status = status;
-        const state = status?.state ?? 'idle';
+    update(snapJob) {
+        this._snap = snapJob;
+        const status = snapJob?.status ?? null;
+        const state = this.state;
+        const lastOk = snapJob?.last_run?.exit_code === 0;
 
         // header
         const names = {
@@ -266,8 +269,9 @@ class BackupJobSection {
             paused: 'Paused',
             deferred: 'Postponed',
             error: 'Error',
+            unavailable: 'Unavailable',
         };
-        const isSuccess = state === 'idle' && (status?.progress ?? 0) >= 100;
+        const isSuccess = state === 'idle' && lastOk;
         const streak = status?.consecutive_failures ?? 0;
         let stateText = names[state] ?? state;
         if (streak >= 2)
@@ -295,21 +299,20 @@ class BackupJobSection {
         this._detailBox.visible = isActive;
         if (isActive && status) {
             if (state === 'scanning') {
-                this._fileLabel.text = 'Building file list\u2026';
+                this._fileLabel.text = 'Building file list…';
                 this._fileLabel.visible = true;
 
                 const sp = [];
-                if (status.scan_read)
+                if (status.scan_read && status.scan_read !== '0 B')
                     sp.push(`${status.scan_read} read`);
                 if (status.started) {
                     const elapsed = this._formatElapsed(status.started);
                     if (elapsed) sp.push(elapsed);
                 }
-                this._statsLabel.text = sp.join('  \u00b7  ');
+                this._statsLabel.text = sp.join('  ·  ');
                 this._statsLabel.visible = sp.length > 0;
                 this._filesLabel.visible = false;
             } else {
-                // current file
                 if (status.current_file) {
                     this._fileLabel.text = this._shortenPath(status.current_file);
                     this._fileLabel.visible = true;
@@ -317,19 +320,17 @@ class BackupJobSection {
                     this._fileLabel.visible = false;
                 }
 
-                // stats: percentage · speed · ETA
                 const parts = [];
-                if (status.progress > 0) parts.push(`${status.progress}%`);
+                if (status.progress > 0) parts.push(`${Math.round(status.progress)}%`);
                 if (status.speed) parts.push(status.speed);
                 if (status.eta && status.eta !== '0:00:00')
                     parts.push(`ETA ${status.eta}`);
-                this._statsLabel.text = parts.join('  \u00b7  ');
+                this._statsLabel.text = parts.join('  ·  ');
                 this._statsLabel.visible = parts.length > 0;
 
-                // file counts
                 if (status.files_total > 0) {
                     this._filesLabel.text =
-                        `${status.files_transferred}\u2009/\u2009${status.files_total} files`;
+                        `${status.files_transferred} / ${status.files_total} files`;
                     this._filesLabel.visible = true;
                 } else {
                     this._filesLabel.visible = false;
@@ -337,29 +338,36 @@ class BackupJobSection {
             }
         }
 
-        // error
-        if (state === 'error' && status?.error) {
+        // error, or why the destination cannot be used
+        if ((state === 'error' || state === 'unavailable') && status?.error) {
             this._errorLabel.text = status.error;
             this._errorLabel.visible = true;
         } else {
             this._errorLabel.visible = false;
         }
 
-        // countdown, or when a postponed run restarts
+        // schedule: when a postponed run restarts, or next run · last run
+        const parts = [];
         if (state === 'deferred') {
-            this._countdownLabel.text = status?.deferred_reason === 'suspend'
-                ? 'Restarts after wake' : 'Restarts at next start';
-            this._countdownLabel.visible = true;
-        } else if (!isActive && !isQueued && this._nextRunIso) {
-            const cd = _formatCountdown(this._nextRunIso);
-            this._countdownLabel.text = cd ? `Next ${cd}` : '';
-            this._countdownLabel.visible = !!cd;
-        } else {
-            this._countdownLabel.visible = false;
+            parts.push(status?.deferred_reason === 'suspend' ? 'Restarts after wake'
+                : status?.deferred_reason === 'interrupted'
+                    ? 'Interrupted — restarts at next start' : 'Restarts at next start');
+        } else if (!isActive && !isQueued) {
+            const cd = snapJob?.next_run ? _formatCountdown(snapJob.next_run) : '';
+            if (cd) parts.push(`Next ${cd}`);
+            const last = snapJob?.last_run;
+            if (last) {
+                let text = `last ${_formatRelativePast(last.started)}`;
+                if (last.host) text += ` on ${last.host}`;
+                if (last.exit_code !== 0) text += ' (failed)';
+                parts.push(text);
+            }
         }
+        this._countdownLabel.text = parts.join('  ·  ');
+        this._countdownLabel.visible = parts.length > 0;
 
         // buttons
-        this._startBtn.visible = !isActive && !isQueued;
+        this._startBtn.visible = !isActive && !isQueued && state !== 'unavailable';
         this._pauseBtn.visible = isActive;
         this._stopBtn.visible = isActive || isQueued;
         this._pauseBtn.child.icon_name = state === 'paused'
@@ -370,51 +378,49 @@ class BackupJobSection {
         if (!p) return '';
         const parts = p.replace(/\/$/, '').split('/');
         if (parts.length <= 2) return p;
-        return '\u2026/' + parts.slice(-2).join('/');
+        return '…/' + parts.slice(-2).join('/');
     }
 
     _formatElapsed(isoStarted) {
-        try {
-            const startMs = new Date(isoStarted).getTime();
-            if (isNaN(startMs)) return '';
-            const sec = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
-            if (sec < 1) return '';
-            const h = Math.floor(sec / 3600);
-            const m = Math.floor((sec % 3600) / 60);
-            const s = sec % 60;
-            if (h > 0)
-                return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-            return `${m}:${String(s).padStart(2, '0')}`;
-        } catch (_e) {
-            return '';
-        }
+        const startMs = new Date(isoStarted).getTime();
+        if (isNaN(startMs)) return '';
+        const sec = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+        if (sec < 1) return '';
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = sec % 60;
+        if (h > 0)
+            return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        return `${m}:${String(s).padStart(2, '0')}`;
     }
 
     // ── actions ──
 
     _onStart() {
-        _runSystemctlAsync(['start', this._job.service]);
+        _runSystemctlAsync(['start', this._job.service], () => this.onChanged?.());
         this._paused = false;
     }
 
     _onStop() {
-        if (this._paused || this._status?.state === 'paused')
-            _runSystemctlAsync(['kill', '--signal=USR2', this._job.service]);
-        _runSystemctlAsync(['stop', this._job.service]);
+        // backup-sync resumes a paused rsync itself before stopping it.
+        _runSystemctlAsync(['stop', this._job.service], () => this.onChanged?.());
         this._paused = false;
     }
 
     _onPause() {
-        if (this._paused || this._status?.state === 'paused') {
-            _runSystemctlAsync(['kill', '--signal=USR2', this._job.service]);
+        if (this._paused || this.state === 'paused') {
+            _runSystemctlAsync(['kill', '--signal=USR2', this._job.service], () => this.onChanged?.());
             this._paused = false;
         } else {
-            _runSystemctlAsync(['kill', '--signal=USR1', this._job.service]);
+            _runSystemctlAsync(['kill', '--signal=USR1', this._job.service], () => this.onChanged?.());
             this._paused = true;
         }
     }
 
-    destroy() {}
+    destroy() {
+        this._item.destroy();
+        this._separator.destroy();
+    }
 }
 
 /* ------------------------------------------------------------- panel position */
@@ -440,10 +446,11 @@ function trayPanelBox(settings) {
 
 export default class BackupMonitorExtension extends Extension {
     enable() {
-        // First-run setup: install backup-sync script and create directories
+        // First-run setup: install backup-sync, the app and its units from a
+        // release zip (install.sh does all of this itself)
         this._firstRunSetup();
 
-        this._indicator = new PanelMenu.Button(0.0, 'Mirror Backup for GNOME', false);
+        this._indicator = new PanelMenu.Button(0.0, 'Mirror Backup', false);
 
         this._panelIcon = new St.Icon({
             icon_name: 'drive-harddisk-symbolic',
@@ -454,25 +461,23 @@ export default class BackupMonitorExtension extends Extension {
 
         this._indicator.menu.box.add_style_class_name('bm-menu');
 
+        // Shown when `mirror-backup status` cannot be read
+        this._problemItem = new PopupMenu.PopupMenuItem('', {reactive: false});
+        this._problemItem.label.add_style_class_name('bm-error');
+        this._problemItem.visible = false;
+        this._indicator.menu.addMenuItem(this._problemItem);
+
         this._jobSections = [];
-        for (const job of _loadJobs()) {
-            const section = new BackupJobSection(job, this._indicator.menu);
-            this._jobSections.push(section);
-        }
+        this._jobsSection = new PopupMenu.PopupMenuSection();
+        this._indicator.menu.addMenuItem(this._jobsSection);
+        this._rebuildSections(_loadJobs());
 
         // "Open Mirror Backup" button at the bottom
         const openAppItem = new PopupMenu.PopupMenuItem('Open Mirror Backup');
         openAppItem.label.add_style_class_name('bm-open-app');
-        const extPath = this.dir.get_path();
         openAppItem.connect('activate', () => {
             try {
-                // App is bundled inside the extension directory at app/
-                const appSrc = GLib.build_filenamev([extPath, 'app']);
-                Gio.Subprocess.new(
-                    ['bash', '-c',
-                     `PYTHONPATH="${appSrc}:\${PYTHONPATH:-}" exec python3 -m backup_monitor.main`],
-                    Gio.SubprocessFlags.NONE,
-                );
+                Gio.Subprocess.new([MIRROR_BACKUP], Gio.SubprocessFlags.NONE);
             } catch (e) {
                 log(`[BackupMonitor] Failed to launch app: ${e.message}`);
             }
@@ -486,79 +491,105 @@ export default class BackupMonitorExtension extends Extension {
             if (open) this._refresh();
         });
 
-        this._pollId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, 3, () => {
-                this._refresh();
-                return GLib.SOURCE_CONTINUE;
-            });
-
-        // Fetch timer info every 30 seconds
-        this._timerPollId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, 30, () => {
-                this._fetchTimerInfo();
-                return GLib.SOURCE_CONTINUE;
-            });
-
+        this._cancellable = new Gio.Cancellable();
+        this._fetching = false;
+        this._pollId = null;
         this._refresh();
-        this._fetchTimerInfo();
+    }
+
+    _rebuildSections(jobs) {
+        for (const s of this._jobSections) s.destroy();
+        this._jobSections = [];
+        for (const job of jobs) {
+            const section = new BackupJobSection(job, this._jobsSection);
+            section.onChanged = () => this._refreshSoon();
+            this._jobSections.push(section);
+        }
+    }
+
+    // Copy a directory tree (the bundled app) file by file.
+    _copyTree(src, dst) {
+        if (!dst.query_exists(null))
+            dst.make_directory_with_parents(null);
+        const children = src.enumerate_children('standard::name,standard::type',
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+        let info;
+        while ((info = children.next_file(null)) !== null) {
+            const name = info.get_name();
+            if (name === '__pycache__') continue;
+            const child = src.get_child(name);
+            if (info.get_file_type() === Gio.FileType.DIRECTORY)
+                this._copyTree(child, dst.get_child(name));
+            else
+                child.copy(dst.get_child(name), Gio.FileCopyFlags.OVERWRITE, null, null);
+        }
+        children.close(null);
+    }
+
+    _readText(file) {
+        try {
+            const [, bytes] = file.load_contents(null);
+            return new TextDecoder().decode(bytes);
+        } catch (_e) {
+            return null;
+        }
     }
 
     _firstRunSetup() {
-        // Install backup-sync script from the bundled copy if not present
         const extDir = this.dir.get_path();
-        const home = GLib.get_home_dir();
-        const binDir = GLib.build_filenamev([home, '.local', 'bin']);
-        const target = GLib.build_filenamev([binDir, 'backup-sync']);
-        const source = GLib.build_filenamev([extDir, 'scripts', 'backup-sync']);
+        GLib.mkdir_with_parents(BIN_DIR, 0o755);
+        GLib.mkdir_with_parents(GLib.build_filenamev([HOME, '.config', 'backup-sync']), 0o755);
 
-        // Create directories
-        for (const dir of [
-            binDir,
-            GLib.build_filenamev([home, '.local', 'share', 'backup-sync', 'status']),
-            GLib.build_filenamev([home, '.local', 'share', 'backup-sync', 'logs']),
-            GLib.build_filenamev([home, '.local', 'share', 'backup-sync', 'history']),
-            GLib.build_filenamev([home, '.config', 'backup-sync']),
-        ]) {
-            GLib.mkdir_with_parents(dir, 0o755);
-        }
-
-        // Copy backup-sync if bundled and newer or missing
-        try {
-            const srcFile = Gio.File.new_for_path(source);
-            if (srcFile.query_exists(null)) {
-                const dstFile = Gio.File.new_for_path(target);
-                srcFile.copy(dstFile, Gio.FileCopyFlags.OVERWRITE, null, null);
-                // Make executable
-                try {
-                    Gio.Subprocess.new(
-                        ['chmod', '+x', target],
-                        Gio.SubprocessFlags.NONE,
-                    );
-                } catch (_e) { /* ignore */ }
+        // backup-sync and mirror-backup from the bundled copies
+        for (const name of ['backup-sync', 'mirror-backup']) {
+            try {
+                const srcFile = Gio.File.new_for_path(
+                    GLib.build_filenamev([extDir, 'scripts', name]));
+                if (!srcFile.query_exists(null)) continue;
+                const target = Gio.File.new_for_path(GLib.build_filenamev([BIN_DIR, name]));
+                srcFile.copy(target, Gio.FileCopyFlags.OVERWRITE, null, null);
+                target.set_attribute_uint32('unix::mode', 0o755, Gio.FileQueryInfoFlags.NONE, null);
+            } catch (e) {
+                log(`[BackupMonitor] Failed to install ${name}: ${e.message}`);
             }
-        } catch (_e) {
-            // Already exists or no bundled script — fine
         }
 
-        // Install and enable the unit that restarts postponed backups at the
+        // The app, where the mirror-backup command expects it — refreshed
+        // whenever the bundled version differs from the installed one.
+        try {
+            const bundled = Gio.File.new_for_path(GLib.build_filenamev([extDir, 'app']));
+            if (bundled.query_exists(null)) {
+                const versionOf = root => this._readText(
+                    root.get_child('backup_monitor').get_child('__init__.py'));
+                const installed = Gio.File.new_for_path(GLib.build_filenamev([APP_HOME, 'app']));
+                if (versionOf(bundled) !== versionOf(installed)) {
+                    this._copyTree(bundled, installed);
+                    const css = Gio.File.new_for_path(GLib.build_filenamev([extDir, 'data', 'style.css']));
+                    if (css.query_exists(null)) {
+                        const dataDir = Gio.File.new_for_path(GLib.build_filenamev([APP_HOME, 'data']));
+                        if (!dataDir.query_exists(null))
+                            dataDir.make_directory_with_parents(null);
+                        css.copy(dataDir.get_child('style.css'), Gio.FileCopyFlags.OVERWRITE, null, null);
+                    }
+                }
+            }
+        } catch (e) {
+            log(`[BackupMonitor] Failed to install the app: ${e.message}`);
+        }
+
+        // The unit that syncs job units and restarts postponed backups at the
         // next start. Bundled in release zips only; install.sh does it itself.
         try {
             const unitName = 'mirror-backup-resume.service';
             const unitSrc = Gio.File.new_for_path(
                 GLib.build_filenamev([extDir, 'systemd', unitName]));
             if (unitSrc.query_exists(null)) {
-                const unitDir = GLib.build_filenamev([home, '.config', 'systemd', 'user']);
+                const unitDir = GLib.build_filenamev([HOME, '.config', 'systemd', 'user']);
                 const unitDst = Gio.File.new_for_path(
                     GLib.build_filenamev([unitDir, unitName]));
                 const wanted = Gio.File.new_for_path(
                     GLib.build_filenamev([unitDir, 'default.target.wants', unitName]));
-                const decoder = new TextDecoder();
-                const [, srcBytes] = unitSrc.load_contents(null);
-                let current = false;
-                if (unitDst.query_exists(null)) {
-                    const [, dstBytes] = unitDst.load_contents(null);
-                    current = decoder.decode(srcBytes) === decoder.decode(dstBytes);
-                }
+                const current = this._readText(unitSrc) === this._readText(unitDst);
                 if (!current || !wanted.query_exists(null)) {
                     GLib.mkdir_with_parents(unitDir, 0o755);
                     unitSrc.copy(unitDst, Gio.FileCopyFlags.OVERWRITE, null, null);
@@ -574,7 +605,7 @@ export default class BackupMonitorExtension extends Extension {
         try {
             const desktopSource = GLib.build_filenamev([extDir, 'data',
                 'com.github.petronijus.BackupMonitor.desktop']);
-            const desktopDir = GLib.build_filenamev([home, '.local', 'share', 'applications']);
+            const desktopDir = GLib.build_filenamev([GLib.get_user_data_dir(), 'applications']);
             const desktopTarget = GLib.build_filenamev([desktopDir,
                 'com.github.petronijus.BackupMonitor.desktop']);
             GLib.mkdir_with_parents(desktopDir, 0o755);
@@ -589,13 +620,11 @@ export default class BackupMonitorExtension extends Extension {
     disable() {
         this._unwatchTrayPos();
         this._stopPulse();
+        this._cancellable?.cancel();
+        this._cancellable = null;
         if (this._pollId) {
             GLib.source_remove(this._pollId);
             this._pollId = null;
-        }
-        if (this._timerPollId) {
-            GLib.source_remove(this._timerPollId);
-            this._timerPollId = null;
         }
         for (const s of this._jobSections) s.destroy();
         this._jobSections = [];
@@ -603,39 +632,59 @@ export default class BackupMonitorExtension extends Extension {
         this._indicator = null;
     }
 
-    _fetchTimerInfo() {
-        // Fetch NextElapseUSecRealtime for each job's timer
-        for (const section of this._jobSections) {
-            const timerName = section._job.id + '.timer';
-            _runSystemctlAsync(
-                ['show', timerName,
-                 '--property=NextElapseUSecRealtime'],
-                (stdout, err) => {
-                    if (err || !stdout) return;
-                    for (const line of stdout.split('\n')) {
-                        if (line.startsWith('NextElapseUSecRealtime=')) {
-                            const val = line.split('=')[1]?.trim();
-                            if (val && val !== 'n/a')
-                                section._nextRunIso = _parseSystemdTimestamp(val);
-                        }
-                    }
-                },
-            );
-        }
+    // A control was just used: ask again shortly, once the job has had a
+    // moment to write its first status.
+    _refreshSoon() {
+        this._schedulePoll(1);
+    }
+
+    _schedulePoll(seconds) {
+        if (this._pollId)
+            GLib.source_remove(this._pollId);
+        this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
+            this._pollId = null;
+            this._refresh();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _refresh() {
+        if (this._fetching || !this._cancellable) return;
+        this._fetching = true;
+        _fetchSnapshot(this._cancellable, (snap, error) => {
+            this._fetching = false;
+            if (!this._indicator) return;
+            const anyActive = this._apply(snap, error);
+            this._schedulePoll(anyActive ? POLL_ACTIVE_S : POLL_IDLE_S);
+        });
+    }
+
+    // Returns whether a backup is active, which sets the next poll interval.
+    _apply(snap, error) {
+        this._problemItem.visible = !!error;
+        if (error) {
+            this._problemItem.label.text = error;
+            this._panelIcon.style_class = 'system-status-icon bm-icon-error';
+            this._stopPulse();
+            return false;
+        }
+
+        const jobs = snap.jobs ?? [];
+        const ids = jobs.map(j => j.id).join('\n');
+        if (ids !== this._jobSections.map(s => s._job.id).join('\n'))
+            this._rebuildSections(jobs.map(j => ({id: j.id, name: j.name, service: j.service})));
+
         let anyActive = false;
         let anyError = false;
-
-        for (const s of this._jobSections) {
-            s.update();
-            const st = s._status?.state;
+        jobs.forEach((job, i) => {
+            const section = this._jobSections[i];
+            section.update(job);
+            const st = section.state;
             if (st === 'running' || st === 'paused' || st === 'scanning' || st === 'queued')
                 anyActive = true;
             if (st === 'error')
                 anyError = true;
-        }
+        });
 
         if (anyError) {
             this._panelIcon.style_class = 'system-status-icon bm-icon-error';
@@ -647,6 +696,7 @@ export default class BackupMonitorExtension extends Extension {
             this._panelIcon.style_class = 'system-status-icon';
             this._stopPulse();
         }
+        return anyActive;
     }
 
     _startPulse() {
@@ -688,6 +738,7 @@ export default class BackupMonitorExtension extends Extension {
             this._panelIcon.opacity = 255;
         }
     }
+
     _placeIndicator() {
         if (!this._indicator)
             return;

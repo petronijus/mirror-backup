@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "petronijus.mirror-backup",
+  "name": "Mirror Backup",
+  "version": "0.6.0",
+  "author": "Petr Parkan Janda",
+  "license": "MIT",
+  "description": "Mirror Backup's rsync jobs in the Omarchy bar: live progress, schedule, last run on any machine, start / pause / stop.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Mirror Backup",
+    "description": "Backup jobs with live progress and controls; the icon pulses while a backup runs and turns urgent on an error.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}

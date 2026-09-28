@@ -7,6 +7,9 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GObject
 
+from pathlib import Path
+
+from backup_monitor import paths
 from backup_monitor.services.job_manager import JobManager, create_exclude_file
 
 FREQ_MODES = ['Weekly', 'Monthly', 'Custom', 'Manual only']
@@ -31,6 +34,7 @@ class JobEditorPage(Adw.NavigationPage):
         self._manager = job_manager
         self._job_id = job_id
         self._job_data = job_manager.get_job(job_id) if job_id else None
+        self._exclude_file = self._job_data.get('exclude_file', '') if self._job_data else ''
 
         # Main layout
         toolbar = Adw.ToolbarView()
@@ -331,6 +335,7 @@ class JobEditorPage(Adw.NavigationPage):
 
         # Exclude file info
         exclude = job.get('exclude_file', '')
+        self._exclude_file = exclude
         if exclude:
             from pathlib import Path
             name = Path(exclude).name
@@ -565,9 +570,7 @@ class JobEditorPage(Adw.NavigationPage):
         from backup_monitor.views.exclusion_editor import ExclusionEditorPage
 
         # Determine exclude file path
-        exclude_file = ''
-        if self._job_data:
-            exclude_file = self._job_data.get('exclude_file', '')
+        exclude_file = self._exclude_file
         if not exclude_file and self._job_id:
             exclude_file = create_exclude_file(self._job_id)
         elif not exclude_file:
@@ -576,6 +579,9 @@ class JobEditorPage(Adw.NavigationPage):
             import re
             safe_name = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
             exclude_file = create_exclude_file(f'backup-{safe_name}')
+        # Remembered for the save: a new job has no stored exclude file yet.
+        self._exclude_file = exclude_file
+        self._exclude_row.set_subtitle(Path(exclude_file).name)
 
         editor = ExclusionEditorPage(exclude_file)
         nav = self.get_root()
@@ -609,10 +615,7 @@ class JobEditorPage(Adw.NavigationPage):
                 'randomized_delay_sec': 0,
             }
 
-        # Determine exclude file
-        exclude_file = ''
-        if self._job_data:
-            exclude_file = self._job_data.get('exclude_file', '')
+        exclude_file = self._exclude_file
 
         # Rsync options
         delete_modes = ['before', 'during', 'after', 'disabled']
@@ -704,17 +707,17 @@ class JobEditorPage(Adw.NavigationPage):
             return
 
         import subprocess
+        # Same protected paths as backup-sync: its own state and the archive.
         args = [
             'rsync', '-a', '--delete', '--dry-run',
             '--info=name1', '--human-readable',
+            '--exclude=.mirror-backup/', '--exclude=/.archive/',
             source, dest,
         ]
 
-        exclude = self._job_data.get('exclude_file', '')
-        if exclude:
-            from pathlib import Path
-            if Path(exclude).is_file():
-                args.insert(-2, f'--exclude-from={exclude}')
+        exclude = paths.resolve_config_path(self._exclude_file)
+        if exclude and Path(exclude).is_file():
+            args.insert(-2, f'--exclude-from={exclude}')
 
         self._show_toast('Running dry-run...')
 

@@ -7,6 +7,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, Gio
 
+from backup_monitor import paths
 from backup_monitor.models.job import BackupJob
 from backup_monitor.models.settings import Settings
 from backup_monitor.services.job_manager import JobManager
@@ -154,7 +155,10 @@ class BackupMonitorWindow(Adw.ApplicationWindow):
         self._nav_view.push(detail)
 
     def _on_view_log(self, detail, job_id, job_name):
-        log_page = LogViewerPage(job_id, job_name)
+        job = next((j for j in self._jobs if j.id == job_id), None)
+        if not job:
+            return
+        log_page = LogViewerPage(job_name, paths.job_paths(job.destination).log)
         self._nav_view.push(log_page)
 
     def _on_job_saved(self, editor, job_id):

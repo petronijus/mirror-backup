@@ -1,7 +1,7 @@
 [Desktop Entry]
-Name=Mirror Backup for GNOME
+Name=Mirror Backup
 Comment=Monitor and manage rsync backups
-Exec=bash -c 'EXT="$HOME/.local/share/gnome-shell/extensions/backup-monitor@petronijus"; PYTHONPATH="$EXT/app:${PYTHONPATH:-}" exec python3 -m backup_monitor.main'
+Exec=bash -c 'exec "$HOME/.local/bin/mirror-backup"'
 Icon=drive-harddisk-symbolic
 Terminal=false
 Type=Application

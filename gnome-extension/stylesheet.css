@@ -48,6 +48,10 @@
     color: #e01b24;
 }
 
+.bm-dot-unavailable {
+    color: #cd9309;
+}
+
 .bm-name {
     font-weight: bold;
 }

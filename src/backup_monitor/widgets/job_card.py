@@ -220,6 +220,7 @@ class JobCard(Gtk.Box):
             'paused': 'Paused',
             'deferred': 'Postponed',
             'error': 'Error',
+            'unavailable': 'Unavailable',
         }
         badge_text = state_names.get(state, state)
         if is_success:
@@ -230,7 +231,7 @@ class JobCard(Gtk.Box):
         # Update CSS classes for state badge
         for cls in ['bm-state-idle', 'bm-state-queued', 'bm-state-running',
                      'bm-state-scanning', 'bm-state-paused', 'bm-state-deferred',
-                     'bm-state-error', 'bm-state-success']:
+                     'bm-state-error', 'bm-state-success', 'bm-state-unavailable']:
             self._state_badge.remove_css_class(cls)
 
         if is_success:
@@ -241,7 +242,7 @@ class JobCard(Gtk.Box):
         # Dot color
         for cls in ['bm-dot-idle', 'bm-dot-queued', 'bm-dot-running',
                      'bm-dot-scanning', 'bm-dot-paused', 'bm-dot-deferred',
-                     'bm-dot-error', 'bm-dot-success']:
+                     'bm-dot-error', 'bm-dot-success', 'bm-dot-unavailable']:
             self._dot.remove_css_class(cls)
 
         if is_success:
@@ -292,10 +293,11 @@ class JobCard(Gtk.Box):
             self._next_run_label.set_label(st.deferred_note)
         else:
             self._next_run_label.set_label(f'Next: {countdown}' if countdown else '')
-        self._last_run_label.set_label(f'Last: {last}' if last else '')
+        where = f' on {self._job.last_run_host}' if last and self._job.last_run_host else ''
+        self._last_run_label.set_label(f'Last: {last}{where}' if last else '')
 
-        # Error
-        if state == 'error' and st.error:
+        # Error (or why the destination cannot be used)
+        if state in ('error', 'unavailable') and st.error:
             self._error_label.set_label(st.error)
             self._error_label.set_visible(True)
         else:
@@ -309,7 +311,7 @@ class JobCard(Gtk.Box):
             self._streak_badge.set_visible(False)
 
         # Buttons
-        self._start_btn.set_visible(not is_active and not is_queued)
+        self._start_btn.set_visible(not is_active and not is_queued and state != 'unavailable')
         self._pause_btn.set_visible(is_active)
         self._stop_btn.set_visible(is_active or is_queued)
 

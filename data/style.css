@@ -30,6 +30,7 @@
 .bm-dot-deferred { color: alpha(@accent_color, 0.55); }
 .bm-dot-success { color: @success_color; }
 .bm-dot-error { color: @error_color; }
+.bm-dot-unavailable { color: alpha(@warning_color, 0.7); }
 
 /* ── State badge ── */
 
@@ -74,6 +75,11 @@
 .bm-state-error {
     color: @error_color;
     background: alpha(@error_color, 0.12);
+}
+
+.bm-state-unavailable {
+    color: @warning_color;
+    background: alpha(@warning_color, 0.10);
 }
 
 .bm-state-attention {

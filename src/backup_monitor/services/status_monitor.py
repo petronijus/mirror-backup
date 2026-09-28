@@ -1,4 +1,4 @@
-"""Status monitor — polls JSON status files and emits signals on change."""
+"""Status monitor — polls each job's status file and emits signals on change."""
 
 from __future__ import annotations
 
@@ -6,12 +6,19 @@ import gi
 gi.require_version('Gio', '2.0')
 from gi.repository import GLib, Gio, GObject
 
-from backup_monitor.models.job import BackupJob, STATUS_DIR
+from backup_monitor import paths
+from backup_monitor.models.job import BackupJob
+from backup_monitor.models.job_history import last_run
 from backup_monitor.services import systemd_service
 
 
 class StatusMonitor(GObject.Object):
-    """Periodically reads backup status files and timer info, emits 'updated' signal."""
+    """Periodically reads the jobs' status files, last runs and timer info, emits 'updated'.
+
+    Status files live in the destinations, often on NFS: inotify there only
+    sees writes made by this machine, so the one-second poll stays the ground
+    truth and the monitors merely make local changes show up sooner.
+    """
 
     __gsignals__ = {
         'updated': (GObject.SignalFlags.RUN_FIRST, None, ()),
@@ -25,7 +32,8 @@ class StatusMonitor(GObject.Object):
         self._jobs = jobs
         self._poll_id = None
         self._timer_poll_id = None
-        self._file_monitor = None
+        self._file_monitors = []
+        self._states: dict[str, str] = {}
 
     @property
     def jobs(self) -> list[BackupJob]:
@@ -42,14 +50,17 @@ class StatusMonitor(GObject.Object):
         self._timer_poll_id = GLib.timeout_add_seconds(
             self.TIMER_POLL_INTERVAL_S, self._on_timer_poll)
 
-        # Also watch the status directory with inotify for instant updates
-        try:
-            status_dir = Gio.File.new_for_path(str(STATUS_DIR))
-            self._file_monitor = status_dir.monitor_directory(
-                Gio.FileMonitorFlags.NONE, None)
-            self._file_monitor.connect('changed', self._on_file_changed)
-        except GLib.Error:
-            pass  # Polling is the fallback
+        for job in self._jobs:
+            state_dir = paths.job_paths(job.destination).state_dir
+            if not state_dir.is_dir():
+                continue
+            try:
+                monitor = Gio.File.new_for_path(str(state_dir)).monitor_directory(
+                    Gio.FileMonitorFlags.NONE, None)
+                monitor.connect('changed', self._on_file_changed)
+                self._file_monitors.append(monitor)
+            except GLib.Error:
+                pass  # Polling is the fallback
 
     def stop(self):
         """Stop all monitoring."""
@@ -59,9 +70,9 @@ class StatusMonitor(GObject.Object):
         if self._timer_poll_id:
             GLib.source_remove(self._timer_poll_id)
             self._timer_poll_id = None
-        if self._file_monitor:
-            self._file_monitor.cancel()
-            self._file_monitor = None
+        for monitor in self._file_monitors:
+            monitor.cancel()
+        self._file_monitors = []
 
     def _on_poll(self) -> bool:
         self._refresh_statuses()
@@ -77,10 +88,22 @@ class StatusMonitor(GObject.Object):
 
     def _refresh_statuses(self):
         for job in self._jobs:
-            job.read_status()
+            state = job.read_status().state
+            # A run just ended (here or elsewhere): its history has a new entry.
+            if self._states.get(job.id) != state:
+                self._refresh_last_run(job)
+                self._states[job.id] = state
         self.emit('updated')
 
+    @staticmethod
+    def _refresh_last_run(job: BackupJob):
+        entry = last_run(job.destination)
+        job.last_run = entry.started if entry else ''
+        job.last_run_host = entry.host if entry else ''
+
     def _refresh_timer_info(self):
+        for job in self._jobs:
+            self._refresh_last_run(job)
         timer_names = [f'{j.id}.timer' for j in self._jobs]
         systemd_service.get_all_timer_info(timer_names, self._on_timer_info)
 
@@ -88,7 +111,6 @@ class StatusMonitor(GObject.Object):
         for job in self._jobs:
             timer_name = f'{job.id}.timer'
             if timer_name in results:
-                next_run, last_run = results[timer_name]
+                next_run, _ = results[timer_name]
                 job.next_run = next_run
-                job.last_run = last_run
         self.emit('updated')

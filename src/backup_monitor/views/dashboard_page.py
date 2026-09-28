@@ -58,14 +58,14 @@ class DashboardPage(Gtk.Box):
             label='Backup Jobs',
             xalign=0,
             hexpand=True,
-            css_classes=['title-1'],
+            css_classes=['title-1', 'bm-title'],
         )
         title_row.append(title)
 
         # Summary label
         self._summary_label = Gtk.Label(
             xalign=1,
-            css_classes=['dim-label'],
+            css_classes=['dim-label', 'bm-summary'],
             valign=Gtk.Align.CENTER,
         )
         title_row.append(self._summary_label)

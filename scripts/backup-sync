@@ -1,62 +1,35 @@
 #!/usr/bin/env bash
 # backup-sync — rsync wrapper with progress tracking and desktop notifications
 # Usage: backup-sync <job-name> <src> <dst> [exclude-file] [archive-days]
-#        backup-sync --resume-deferred
+#
+# Where things live (src/backup_monitor/paths.py resolves the same paths):
+#   <dst>/.mirror-backup/          status.json, history.jsonl, backup.log, deferred
+#       The job's state travels with its mirror: every machine or OS that
+#       mounts the destination sees the same status and history, so a run done
+#       on one of them counts on the others.
+#   $XDG_RUNTIME_DIR/backup-sync/  queue.lock, <job>.pid, <job>.progress
+#       Meaningful for this boot only.
 #
 # A run cut short by suspend, shutdown or logout is postponed, not failed:
 # suspend stops rsync and runs it again after wake, shutdown/logout leave a
-# <job>.deferred marker that `--resume-deferred` (mirror-backup-resume.service,
-# once per user-manager start) turns back into a run.
+# `deferred` marker that `mirror-backup resume` (mirror-backup-resume.service,
+# once per user-manager start) turns back into a run — on whichever machine
+# mounts the destination next.
 
 set -euo pipefail
 
-STATUS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/status"
-LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/logs"
-HISTORY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/backup-sync/history"
-mkdir -p "$STATUS_DIR" "$LOG_DIR" "$HISTORY_DIR"
-
-# Start every job whose last run did not get to finish: postponed ones (a
-# .deferred marker) and ones killed without warning — power loss, hard reset,
-# a hung kernel — whose status file still says active but predates this boot.
-resume_deferred() {
-    local boot_epoch marker status_file job state updated updated_epoch
-    local -A pending=()
-    boot_epoch=$(awk '/^btime / {print $2}' /proc/stat)
-    shopt -s nullglob
-
-    for marker in "$STATUS_DIR"/*.deferred; do
-        pending["$(basename "$marker" .deferred)"]="postponed"
-    done
-
-    for status_file in "$STATUS_DIR"/*.json; do
-        job=$(basename "$status_file" .json)
-        state=$(grep -oP '"state":\s*"\K[^"]+' "$status_file" 2>/dev/null) || continue
-        case "$state" in
-            running|scanning|paused|queued) ;;
-            *) continue ;;
-        esac
-        updated=$(grep -oP '"updated":\s*"\K[^"]+' "$status_file" 2>/dev/null) || continue
-        updated_epoch=$(date -d "$updated" +%s 2>/dev/null) || continue
-        if (( updated_epoch < boot_epoch )); then
-            pending["$job"]="interrupted"
-        fi
-    done
-
-    for job in "${!pending[@]}"; do
-        if [[ "$(systemctl --user show -P LoadState "$job.service" 2>/dev/null)" != loaded ]]; then
-            echo "$job: unit no longer exists, dropping its ${pending[$job]} run"
-            rm -f "$STATUS_DIR/$job.deferred"
-            continue
-        fi
-        echo "$job: restarting ${pending[$job]} run"
-        systemctl --user start --no-block "$job.service"
-    done
-}
-
+# Installs up to 0.5 called this from mirror-backup-resume.service. Only the
+# app knows every job's destination, so the work moved there.
 if [[ "${1:-}" == "--resume-deferred" ]]; then
-    resume_deferred
-    exit 0
+    if command -v mirror-backup >/dev/null; then
+        exec mirror-backup resume
+    fi
+    echo "backup-sync: --resume-deferred moved to 'mirror-backup resume', which is not installed" >&2
+    exit 1
 fi
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/backup-sync"
+mkdir -p "$RUNTIME_DIR"
 
 JOB_NAME="${1:?Usage: backup-sync <job-name> <src> <dst> [exclude-file] [archive-days]}"
 SRC="${2:?Missing source path}"
@@ -64,12 +37,20 @@ DST="${3:?Missing destination path}"
 EXCLUDE_FILE="${4:-}"
 ARCHIVE_DAYS="${5:-0}"
 
-STATUS_FILE="$STATUS_DIR/$JOB_NAME.json"
-PID_FILE="$STATUS_DIR/$JOB_NAME.pid"
-LOG_FILE="$LOG_DIR/$JOB_NAME.log"
-PROGRESS_FILE="$STATUS_DIR/$JOB_NAME.progress"
-LOCK_FILE="$STATUS_DIR/backup-sync.lock"
-DEFERRED_FILE="$STATUS_DIR/$JOB_NAME.deferred"
+DST_DIR="${DST%/}"
+[[ -n "$DST_DIR" ]] || DST_DIR=/
+STATE_DIR="$DST_DIR/.mirror-backup"
+STATUS_FILE="$STATE_DIR/status.json"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+LOG_FILE="$STATE_DIR/backup.log"
+DEFERRED_FILE="$STATE_DIR/deferred"
+PID_FILE="$RUNTIME_DIR/$JOB_NAME.pid"
+PROGRESS_FILE="$RUNTIME_DIR/$JOB_NAME.progress"
+LOCK_FILE="$RUNTIME_DIR/queue.lock"
+STATE_OK=0         # 1 once $STATE_DIR exists — nothing is written to $DST before
+
+HOST="${HOSTNAME:-$(uname -n)}"
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 
 # logind endpoint the suspend guard listens to. Overridable only so the
 # suspend path can be exercised against a fake logind on the session bus.
@@ -137,11 +118,12 @@ format_bytes() {
 write_status() {
     local state="$1"
     local escaped_file escaped_error
+    (( STATE_OK )) || return 0
     escaped_file=$(json_escape "${CURRENT_FILE:-}")
     escaped_error=$(json_escape "${ERROR_MSG:-}")
     cat > "${STATUS_FILE}.tmp" <<-JEOF
 {
-  "job": "$JOB_NAME",
+  "job": "$(json_escape "$JOB_NAME")",
   "state": "$state",
   "progress": ${LAST_PCT:-0},
   "speed": "${LAST_SPEED:-}",
@@ -155,8 +137,10 @@ write_status() {
   "started": "$START_TIME",
   "updated": "$(date -Iseconds)",
   "scan_read": "${SCAN_READ:-}",
-  "src": "$SRC",
-  "dst": "$DST",
+  "src": "$(json_escape "$SRC")",
+  "dst": "$(json_escape "$DST")",
+  "host": "$(json_escape "$HOST")",
+  "boot_id": "$BOOT_ID",
   "error": "$escaped_error",
   "deferred_reason": "${DEFER_REASON:-}",
   "consecutive_failures": ${CONSECUTIVE_FAILURES:-0},
@@ -613,16 +597,111 @@ trap cleanup EXIT
 
 # --- preflight checks ---
 
-if [[ ! -d "$SRC" ]]; then
-    ERROR_MSG="Source not found: $SRC"
+# preflight_fail <message>: this run cannot start. The status is written only
+# when the destination is usable — never into an unmounted mount point.
+preflight_fail() {
+    ERROR_MSG="$1"
+    echo "$JOB_NAME: $ERROR_MSG" >&2
     write_status "error"
     notify "✖ $JOB_NAME" "$ERROR_MSG"
     FINISHED=1
     exit 1
+}
+
+# Every mount point fstab lists on the way from $1 up to / must be mounted. An
+# unmounted mount point is an empty directory on the parent filesystem: as a
+# destination it would fill the system disk with a second copy of the source,
+# as a source it would make rsync --delete empty the mirror.
+# BACKUP_SYNC_FSTAB points the lookup at another fstab — for the tests only.
+UNMOUNTED=""
+require_mounted() {
+    local dir
+    dir=$(realpath -m -- "$1")
+    while :; do
+        if findmnt -s ${BACKUP_SYNC_FSTAB:+-F "$BACKUP_SYNC_FSTAB"} -n -M "$dir" >/dev/null 2>&1 \
+                && ! mountpoint -q -- "$dir" 2>/dev/null; then
+            UNMOUNTED="$dir"
+            return 1
+        fi
+        [[ "$dir" == / ]] && return 0
+        dir=$(dirname -- "$dir")
+    done
+}
+
+# Anything in $1 besides the directories backup-sync keeps there itself?
+has_entries() {
+    [[ -n "$(find "$1" -mindepth 1 -maxdepth 1 ! -name .mirror-backup ! -name .archive \
+        -print -quit 2>/dev/null)" ]]
+}
+
+require_mounted "$DST_DIR" || preflight_fail "Destination not mounted: $UNMOUNTED"
+# Never created here: a missing destination is a missing mount far more often
+# than a new job, and the app creates new destinations when it saves the job.
+[[ -d "$DST_DIR" ]] || preflight_fail "Destination not found: $DST (not mounted?)"
+mkdir -p "$STATE_DIR" 2>/dev/null || preflight_fail "Cannot write to the destination: $STATE_DIR"
+STATE_OK=1
+
+require_mounted "$SRC" || preflight_fail "Source not mounted: $UNMOUNTED"
+[[ -d "$SRC" ]] || preflight_fail "Source not found: $SRC"
+if [[ "${BACKUP_SYNC_DELETE_MODE:-before}" != disabled ]] && ! has_entries "$SRC" \
+        && has_entries "$DST_DIR"; then
+    preflight_fail "Source is empty but the mirror is not — refusing to delete the whole backup ($SRC not mounted?)"
 fi
 
-if [[ ! -d "$DST" ]]; then
-    mkdir -p "$DST"
+# --- a scheduled run another machine already made ---
+#
+# systemd sets TRIGGER_UNIT for a service its timer started. Persistent timers
+# catch up on runs missed while this install was down — but the history is
+# shared, and when another machine (the other OS of a dual boot, typically)
+# succeeded after the last scheduled time, the catch-up would only repeat it.
+# The slot counts as covered when the first scheduled time after the start of
+# the last successful run still lies in the future.
+
+# The timer's calendar expressions, one per line.
+trigger_calendars() {
+    if [[ -n "${BACKUP_SYNC_SCHEDULE:-}" ]]; then   # tests
+        printf '%s\n' "$BACKUP_SYNC_SCHEDULE"
+        return
+    fi
+    systemctl --user show -P TimersCalendar "$TRIGGER_UNIT" 2>/dev/null \
+        | sed -n 's/.*OnCalendar=\(.*\) ; next_elapse=.*/\1/p'
+}
+
+# "<started>\t<host>" of the newest successful run in the history, if any.
+last_success() {
+    [[ -f "$HISTORY_FILE" ]] || return 0
+    awk '/"exit_code":[[:space:]]*0[,}]/ { line = $0 } END { if (line == "") exit
+        started = line; sub(/.*"started":"/, "", started); sub(/".*/, "", started)
+        host = ""; if (line ~ /"host":"/) { host = line; sub(/.*"host":"/, "", host); sub(/".*/, "", host) }
+        print started "\t" host }' "$HISTORY_FILE"
+}
+
+# Epoch of the first elapse of any of the calendars after epoch $1.
+next_elapse_after() {
+    local base="$1" when first=""
+    local -a calendars=()
+    mapfile -t calendars < <(trigger_calendars)
+    (( ${#calendars[@]} )) || return 1
+    while IFS= read -r when; do
+        when=$(date -u -d "$when" +%s 2>/dev/null) || continue
+        [[ -z "$first" ]] || (( when < first )) && first="$when"
+    done < <(systemd-analyze calendar --iterations=1 --base-time="@$base" "${calendars[@]}" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*(in UTC): //p')
+    [[ -n "$first" ]] && echo "$first"
+}
+
+if [[ -n "${TRIGGER_UNIT:-}" ]]; then
+    IFS=$'\t' read -r LAST_STARTED LAST_HOST < <(last_success) || true
+    if [[ -n "${LAST_STARTED:-}" ]] \
+            && LAST_EPOCH=$(date -d "$LAST_STARTED" +%s 2>/dev/null) \
+            && NEXT_DUE=$(next_elapse_after "$LAST_EPOCH") \
+            && (( NEXT_DUE > $(date +%s) )); then
+        MSG="skipped: the run started $LAST_STARTED${LAST_HOST:+ on $LAST_HOST} covers this slot, next due $(date -d "@$NEXT_DUE" -Iseconds)"
+        echo "=== $(date -Iseconds) === $TRIGGER_UNIT $MSG ===" >> "$LOG_FILE"
+        echo "$JOB_NAME: $MSG"
+        FINISHED=1
+        exit 0
+    fi
 fi
 
 # --- job queue: wait for exclusive lock ---
@@ -681,6 +760,10 @@ RSYNC_ARGS=(
     --no-inc-recursive
     --human-readable
     --outbuf=L
+    # The job's own state in the destination: excluded, so --delete leaves it
+    # alone. Unanchored, so another job's state inside the source (a job whose
+    # destination lies within this one's source) is not mirrored either.
+    --exclude=.mirror-backup/
 )
 
 [[ -n "$DELETE_ARG" ]] && RSYNC_ARGS+=("$DELETE_ARG")
@@ -850,11 +933,10 @@ fi
 FINISH_TIME="$(date -Iseconds)"
 FINISH_EPOCH="$(date +%s)"
 DURATION_SEC=$(( FINISH_EPOCH - START_EPOCH ))
-HISTORY_FILE="$HISTORY_DIR/$JOB_NAME.jsonl"
-printf '{"started":"%s","finished":"%s","duration_sec":%d,"exit_code":%d,"files_transferred":%d,"files_total":%d,"error":"%s"}\n' \
+printf '{"started":"%s","finished":"%s","duration_sec":%d,"exit_code":%d,"files_transferred":%d,"files_total":%d,"error":"%s","host":"%s"}\n' \
     "$START_TIME" "$FINISH_TIME" "$DURATION_SEC" "$HISTORY_EXIT" \
     "${FILES_XFRD:-0}" "${FILES_TOTAL:-0}" \
-    "$(json_escape "${ERROR_MSG:-}")" \
+    "$(json_escape "${ERROR_MSG:-}")" "$(json_escape "$HOST")" \
     >> "$HISTORY_FILE"
 
 # --- compute consecutive failure streak + detect suggested excludes ---

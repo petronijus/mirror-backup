@@ -1,12 +1,15 @@
 # Once per start of the user's service manager (boot, or login without
-# lingering): start every backup job that a shutdown, logout, crash or power
-# loss cut short. See `backup-sync --resume-deferred`.
+# lingering): bring the job units in line with jobs.json — another machine
+# sharing it may have changed a job — then start every backup that a
+# shutdown, logout, crash or power loss cut short, here or on that machine.
 [Unit]
-Description=Mirror Backup: restart backups interrupted by shutdown or crash
+Description=Mirror Backup: sync job units, restart interrupted backups
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/backup-sync --resume-deferred
+# "-": a unit that could not be written must not keep interrupted runs down.
+ExecStart=-%h/.local/bin/mirror-backup sync-units
+ExecStart=%h/.local/bin/mirror-backup resume
 
 [Install]
 WantedBy=default.target

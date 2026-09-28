@@ -1,17 +1,21 @@
-"""Mirror Backup for GNOME — GTK4/libadwaita desktop app for managing rsync backups."""
+"""Mirror Backup for GNOME — GTK4/libadwaita desktop app for managing rsync backups.
+
+The app itself. `python3 -m backup_monitor` is the entry point that also runs
+the command line (backup_monitor.cli) without loading GTK.
+"""
 
 from __future__ import annotations
 
 import sys
-import os
 from pathlib import Path
 
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, Gdk, Gio, GLib
+from gi.repository import Gtk, Adw, Gdk, Gio
 
 from backup_monitor import APP_ID
+from backup_monitor.desktop_style import DesktopStyle
 from backup_monitor.window import BackupMonitorWindow
 
 
@@ -27,6 +31,9 @@ class BackupMonitorApp(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         self._load_css()
+        # On Omarchy: the current theme's look, kept in step with theme switches.
+        self._desktop_style = DesktopStyle()
+        self._desktop_style.start()
 
     def do_activate(self):
         win = self.get_active_window()
@@ -59,36 +66,11 @@ class BackupMonitorApp(Adw.Application):
                 break
 
 
-def _regenerate_units() -> int:
-    """Rewrite all .timer/.service units from jobs.json (authoritative)."""
-    from backup_monitor.services.job_manager import JobManager
-
-    mgr = JobManager()
-    jobs = mgr.jobs
-    if not jobs:
-        print('[regenerate-units] No jobs in jobs.json — nothing to do.')
-        return 0
-
-    for job in jobs:
-        mgr._generate_systemd_units(job)
-        print(f"[regenerate-units] wrote {job['id']}.service + .timer "
-              f"({job.get('schedule', {}).get('expression', '?')})")
-
-    mgr._daemon_reload()
-
-    for job in jobs:
-        if job.get('enabled', True):
-            mgr._enable_timer(job['id'])
-        else:
-            mgr._disable_timer(job['id'])
-
-    print(f'[regenerate-units] done — {len(jobs)} job(s) regenerated.')
-    return 0
-
-
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == '--regenerate-units':
-        return _regenerate_units()
+    # Installs up to 0.5 ran `python3 -m backup_monitor.main --regenerate-units`.
+    from backup_monitor import cli
+    if len(sys.argv) > 1 and sys.argv[1] in (*cli.COMMANDS, '--regenerate-units'):
+        return cli.main(sys.argv[1:])
     app = BackupMonitorApp()
     return app.run(sys.argv)
 

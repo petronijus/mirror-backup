@@ -74,7 +74,7 @@ class JobDetailPage(Adw.NavigationPage):
         state_display = {
             'idle': 'Idle', 'queued': 'Queued', 'scanning': 'Scanning',
             'running': 'Syncing', 'paused': 'Paused', 'deferred': 'Postponed',
-            'error': 'Error',
+            'error': 'Error', 'unavailable': 'Destination unavailable',
         }
         status_group.add(self._info_row('State', state_display.get(st.state, st.state)))
         if st.state == 'deferred':
@@ -86,8 +86,10 @@ class JobDetailPage(Adw.NavigationPage):
             status_group.add(self._info_row('Next run', countdown or self._job.next_run))
         if self._job.last_run:
             from backup_monitor.services.systemd_service import format_relative_past
-            last = format_relative_past(self._job.last_run)
-            status_group.add(self._info_row('Last triggered', last or self._job.last_run))
+            last = format_relative_past(self._job.last_run) or self._job.last_run
+            if self._job.last_run_host:
+                last = f'{last} on {self._job.last_run_host}'
+            status_group.add(self._info_row('Last run', last))
 
         if st.state in ('running', 'scanning', 'paused'):
             if st.progress > 0:
@@ -100,7 +102,7 @@ class JobDetailPage(Adw.NavigationPage):
                 status_group.add(self._info_row(
                     'Files', f'{st.files_transferred} / {st.files_total}'))
 
-        if st.state == 'error' and st.error:
+        if st.state in ('error', 'unavailable') and st.error:
             error_row = self._info_row('Error', st.error)
             error_row.add_css_class('error')
             status_group.add(error_row)
@@ -118,7 +120,7 @@ class JobDetailPage(Adw.NavigationPage):
             self._build_suggested_excludes(content, st.suggested_excludes)
 
         # ── Statistics ──
-        entries = read_history(self._job.id)
+        entries = read_history(self._job.destination)
         stats = compute_stats(entries)
 
         if stats.total_runs > 0:
@@ -150,7 +152,7 @@ class JobDetailPage(Adw.NavigationPage):
 
         log_row = Adw.ActionRow(
             title='View full log',
-            subtitle=f'{self._job.id}.log',
+            subtitle=f'{self._job.destination.rstrip("/")}/.mirror-backup/backup.log',
             activatable=True,
         )
         log_row.add_suffix(Gtk.Image(icon_name='go-next-symbolic'))
@@ -196,7 +198,8 @@ class JobDetailPage(Adw.NavigationPage):
         """Append a path to the job's exclude file (idempotent)."""
         from pathlib import Path
 
-        exclude_path = Path(self._job.exclude_file).expanduser()
+        from backup_monitor import paths
+        exclude_path = Path(paths.resolve_config_path(self._job.exclude_file))
         try:
             existing = ''
             if exclude_path.is_file():
@@ -224,9 +227,10 @@ class JobDetailPage(Adw.NavigationPage):
         icon = 'emblem-ok-symbolic' if entry.success else 'dialog-error-symbolic'
         status_text = 'OK' if entry.success else f'Failed (exit {entry.exit_code})'
 
+        where = f'  ·  {entry.host}' if entry.host else ''
         row = Adw.ActionRow(
             title=entry.started_relative,
-            subtitle=f'{status_text}  ·  {entry.duration_formatted}  ·  {entry.files_transferred} files',
+            subtitle=f'{status_text}  ·  {entry.duration_formatted}  ·  {entry.files_transferred} files{where}',
         )
 
         status_icon = Gtk.Image(
