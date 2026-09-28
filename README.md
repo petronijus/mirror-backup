@@ -1,6 +1,6 @@
-# Mirror Backup for GNOME
+# Mirror Backup
 
-> Scheduled rsync mirroring, watched live from your GNOME panel.
+> Scheduled rsync mirroring, watched live from your panel — GNOME Shell or Omarchy.
 
 Rsync-based backup for Linux with systemd scheduling, a panel indicator (GNOME Shell, or the Omarchy bar), and a GTK4/libadwaita desktop app — set up jobs once, watch them in the corner of your eye. Several installs can share one set of jobs and one state — the two operating systems of a dual boot, say — and each run counts for all of them.
 
@@ -90,9 +90,12 @@ Omarchy leaves GTK apps on stock Adwaita; this one takes the current Omarchy
 theme instead — its palette (`colors.toml`), the control tokens the shell
 draws with (`shell.toml`), the monospace UI font, square corners, flat
 hairline borders and the shell's small-caps section headers, dark or light as
-the theme says. Switching the theme restyles the open window. The stylesheet
-is generated in `src/backup_monitor/desktop_theme.py`;
-`MIRROR_BACKUP_THEME=adwaita` (or `omarchy`) overrides the detection.
+the theme says. Switching the theme restyles the open window. The look is
+`src/backup_monitor/adw_omarchy.py` — a self-contained module other libadwaita
+apps can carry too (gdrive-for-linux does): `scripts/vendor-adw-omarchy.sh
+<app>/adw_omarchy.py` copies it there, stamped with its hash, and `--check`
+tells a current copy from an outdated or hand-edited one. `desktop_theme.py`
+adds Mirror Backup's own widgets. `MIRROR_BACKUP_THEME=adwaita` (or `omarchy`) overrides the detection.
 
 ### Launch
 
@@ -299,7 +302,7 @@ GitHub release:
   `gnome-extensions install --force <zip>` (no root needed; log out/in to
   activate). Includes the panel indicator, the bundled GTK4 app and the
   `backup-sync` script.
-- `mirror-backup-gnome-vX.Y.Z.tar.gz` — source tarball for `./install.sh` installs.
+- `mirror-backup-vX.Y.Z.tar.gz` — source tarball for `./install.sh` installs.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 

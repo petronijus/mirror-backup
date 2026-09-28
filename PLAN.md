@@ -1,4 +1,4 @@
-# Mirror Backup for GNOME — Desktop App — Implementation Plan
+# Mirror Backup — Desktop App — Implementation Plan
 
 ## Architecture Philosophy
 - **GNOME Shell extension** = primary daily interface (panel indicator, quick status, controls)

@@ -27,7 +27,7 @@ class BackupMonitorWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(
             application=app,
-            title='Mirror Backup for GNOME',
+            title='Mirror Backup',
             default_width=550,
             default_height=700,
         )
@@ -176,7 +176,7 @@ class BackupMonitorWindow(Adw.ApplicationWindow):
     def _on_about(self, action, param):
         from backup_monitor import APP_VERSION
         about = Adw.AboutDialog(
-            application_name='Mirror Backup for GNOME',
+            application_name='Mirror Backup',
             application_icon='drive-harddisk-symbolic',
             version=APP_VERSION,
             developer_name='Petr Parkan Janda',

@@ -14,5 +14,5 @@ build/
 .vscode/
 .idea/
 
-# Private overlay (clone of mirror-backup-gnome-private)
+# Private overlay (clone of mirror-backup-private)
 /private/

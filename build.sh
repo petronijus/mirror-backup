@@ -9,7 +9,7 @@ EXT_UUID="backup-monitor@petronijus"
 VERSION="${1:-$(grep -oP "APP_VERSION = '\K[^']+" "$SCRIPT_DIR/src/backup_monitor/__init__.py")}"
 BUILD_DIR="$SCRIPT_DIR/build"
 
-echo "=== Building Mirror Backup for GNOME v${VERSION} ==="
+echo "=== Building Mirror Backup v${VERSION} ==="
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -55,8 +55,8 @@ echo "  ✔ $ZIP_FILE ($(du -h "$ZIP_FILE" | cut -f1))"
 
 # ── 2. Source tarball ──
 echo "Building source tarball..."
-TARBALL="$BUILD_DIR/mirror-backup-gnome-v${VERSION}.tar.gz"
-git archive --format=tar.gz --prefix="mirror-backup-gnome-v${VERSION}/" HEAD -o "$TARBALL"
+TARBALL="$BUILD_DIR/mirror-backup-v${VERSION}.tar.gz"
+git archive --format=tar.gz --prefix="mirror-backup-v${VERSION}/" HEAD -o "$TARBALL"
 echo "  ✔ $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 
 # ── Done ──
@@ -71,4 +71,4 @@ echo "  gnome-extensions install --force $ZIP_FILE"
 echo "  # Then log out/in to activate"
 echo ""
 echo "Install from tarball:"
-echo "  tar xzf $TARBALL && cd mirror-backup-gnome-v${VERSION} && ./install.sh"
+echo "  tar xzf $TARBALL && cd mirror-backup-v${VERSION} && ./install.sh"

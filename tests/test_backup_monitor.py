@@ -9,6 +9,7 @@ config, units, trash or systemd.
 from __future__ import annotations
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -164,42 +165,18 @@ class TimeFormatTest(unittest.TestCase):
                                                'Yesterday ' + entry.started_datetime.strftime('%H:%M')))
 
 
-class DesktopThemeTest(Sandbox):
-    def theme(self, colors: str, shell: str = '') -> Path:
-        d = self.root / 'state/omarchy/current/theme'
-        d.mkdir(parents=True)
-        (d / 'colors.toml').write_text(colors)
-        if shell:
-            (d / 'shell.toml').write_text(shell)
-        return d
+class OmarchyLookTest(Sandbox):
+    """The look is adw_omarchy (tests/test_adw_omarchy.py); the app adds its own rules."""
 
-    def test_palette_from_colors_and_shell_tokens(self):
-        d = self.theme('mode = "light"\naccent = "#1e66f5"\nbackground = "#eff1f5"\n'
-                       'foreground = "#4c4f69"\nred = "not-a-color"\n',
-                       '[controls]\nnormal-border-alpha = 0.3\nhover-cursor-fill-alpha = 0.1\n')
-        p = desktop_theme.load_palette(d)
-        self.assertFalse(p.dark)
-        self.assertEqual((p.accent, p.background, p.foreground), ('#1e66f5', '#eff1f5', '#4c4f69'))
-        self.assertEqual(p.red, desktop_theme.Palette().red)   # invalid value → default
-        self.assertEqual((p.alphas['normal-border'], p.alphas['hover-fill']), (0.3, 0.1))
+    def test_app_rules_use_the_palette(self):
+        from backup_monitor.adw_omarchy import Palette
+        css = desktop_theme.extra_css(Palette(accent='#123456', background='#000001'))
+        self.assertIn('.bm-weekday-btn:checked { background: #123456; color: #000001;', css)
 
-    def test_missing_theme_gives_no_palette(self):
-        self.assertIsNone(desktop_theme.load_palette(self.root / 'nothing'))
-
-    def test_css_carries_the_palette(self):
-        css = desktop_theme.build_css(desktop_theme.Palette(accent='#123456'))
-        self.assertIn('@define-color accent_bg_color #123456;', css)
-        self.assertIn('--accent-bg-color: #123456;', css)
-        self.assertIn('border-radius: 0;', css)
-
-    def test_detection_and_override(self):
-        with mock.patch.dict(os.environ, {'XDG_STATE_HOME': str(self.root / 'state'),
-                                          'OMARCHY_PATH': '/usr/share/omarchy'}):
-            self.assertEqual(desktop_theme.wanted_theme(), 'adwaita')   # no theme yet
-            self.theme('accent = "#7aa2f7"\n')
-            self.assertEqual(desktop_theme.wanted_theme(), 'omarchy')
-            with mock.patch.dict(os.environ, {'MIRROR_BACKUP_THEME': 'adwaita'}):
-                self.assertEqual(desktop_theme.wanted_theme(), 'adwaita')
+    def test_env_var_overrides_detection(self):
+        from backup_monitor.adw_omarchy import wanted_theme
+        with mock.patch.dict(os.environ, {desktop_theme.ENV_VAR: 'adwaita'}):
+            self.assertEqual(wanted_theme(desktop_theme.ENV_VAR), 'adwaita')
 
 
 class UnitsTest(Sandbox):

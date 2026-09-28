@@ -1,4 +1,4 @@
-"""Mirror Backup for GNOME — GTK4/libadwaita desktop app for managing rsync backups.
+"""Mirror Backup — GTK4/libadwaita desktop app for managing rsync backups.
 
 The app itself. `python3 -m backup_monitor` is the entry point that also runs
 the command line (backup_monitor.cli) without loading GTK.
@@ -15,7 +15,7 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, Gdk, Gio
 
 from backup_monitor import APP_ID
-from backup_monitor.desktop_style import DesktopStyle
+from backup_monitor import desktop_theme
 from backup_monitor.window import BackupMonitorWindow
 
 
@@ -32,8 +32,8 @@ class BackupMonitorApp(Adw.Application):
         Adw.Application.do_startup(self)
         self._load_css()
         # On Omarchy: the current theme's look, kept in step with theme switches.
-        self._desktop_style = DesktopStyle()
-        self._desktop_style.start()
+        self._omarchy_style = desktop_theme.omarchy_style()
+        self._omarchy_style.start()
 
     def do_activate(self):
         win = self.get_active_window()

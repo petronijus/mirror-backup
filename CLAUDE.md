@@ -1,4 +1,4 @@
-# Mirror Backup for GNOME
+# Mirror Backup
 
 Linux rsync backup system: `scripts/backup-sync` (bash) + systemd user timers +
 GTK4/libadwaita app with a command line (`src/backup_monitor/`, run as
@@ -22,11 +22,16 @@ architecture, especially "Several machines, one set of jobs".
 
 ## Look on Omarchy
 
-`desktop_theme.py` (GTK-free, tested) turns the current Omarchy theme into a
-libadwaita stylesheet; `desktop_style.py` applies it above the app's own CSS
-and reloads on theme switches. GNOME is untouched. Test windows open on the
-user's live desktop — prefer the CSS parse check and unit tests over
-screenshots, and never leave a test window where a click could save a job.
+`src/backup_monitor/adw_omarchy.py` is the **canonical** copy of the Omarchy
+look; gdrive-for-linux carries a vendored copy (`app/adw_omarchy.py`). After
+changing it here, re-vendor: `scripts/vendor-adw-omarchy.sh
+~/Documents/Dev/gdrive-for-linux/app/adw_omarchy.py` (its tests fail on a
+stale or hand-edited copy). tests/test_adw_omarchy.py parses the CSS for every
+theme Omarchy ships. `desktop_theme.py`
+holds only Mirror Backup's own rules (`extra_css`). GNOME is untouched.
+Look at it headless — `gtk4-broadwayd :7`, run the app with
+`GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`, screenshot http://127.0.0.1:8087/
+with `chromium --headless=new --screenshot` — not in a window on the live desktop.
 
 ## Tests
 
@@ -43,8 +48,8 @@ stdlib `unittest` (no pytest), the widget's `Model.js` runs under node,
   is the separate e.g.o integer — bump when extension content changes.
   `omarchy-plugin/manifest.json` has its own `version`.
 - Private overlay: `private/` (gitignored) = clone of
-  `petronijus/mirror-backup-gnome-private` — Petr's jobs in
+  `petronijus/mirror-backup-private` — Petr's jobs in
   `private/configs/backup-sync/` (jobs.json + excludes). `install.sh` links
   `~/.config/backup-sync` to it, so Ubuntu and Omarchy on petronijus-PC (which
   share `~/Documents`) run the same jobs.
-  Bootstrap: `git clone git@github.com:petronijus/mirror-backup-gnome-private.git private`
+  Bootstrap: `git clone git@github.com:petronijus/mirror-backup-private.git private`
