@@ -4,8 +4,9 @@
   "description": "Scheduled rsync mirroring with a live panel indicator and a desktop app.",
   "shell-version": [
     "49",
-    "50"
+    "50",
+    "51"
   ],
-  "version": 9,
+  "version": 10,
   "url": "https://github.com/petronijus/mirror-backup"
 }

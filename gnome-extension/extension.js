@@ -125,7 +125,7 @@ class BackupJobSection {
             can_focus: false,
         });
         this._box = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
             style_class: 'bm-job',
         });
@@ -174,7 +174,7 @@ class BackupJobSection {
 
         // ── detail rows ──
         this._detailBox = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
             style_class: 'bm-details',
         });
