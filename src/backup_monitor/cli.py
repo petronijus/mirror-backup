@@ -1,6 +1,7 @@
 """Command line: `mirror-backup <command>`. No GTK is imported on this path.
 
-    status [--json] [--watch]   every job's state (--watch: a JSON line per change)
+    status [--json] [--watch]   every job's state (--watch: a JSON line per change);
+                                exits 75 without reading while a suspend is under way
     sync-units                  make the systemd units match jobs.json
     resume                      restart runs postponed or cut short, on any machine
     migrate-legacy [--from DIR] [--retire] [--dry-run]
@@ -26,8 +27,16 @@ from backup_monitor.fsutil import atomic_write_text, trash
 from backup_monitor.models.job import is_stale_active
 from backup_monitor.services import snapshot as snap
 from backup_monitor.services.job_manager import JobManager, load_jobs
+from backup_monitor.services.sleep_guard import (LOGIND_NAME, SleepGuard,
+                                                 SuspendInProgress, guarded_read)
+
+from gi.repository import GLib  # noqa: E402  (sleep_guard pins the version)
 
 COMMANDS = ('status', 'sync-units', 'resume', 'migrate-legacy')
+
+# `status` while a suspend is under way: nothing was read (EX_TEMPFAIL).
+EXIT_SUSPENDING = 75
+GUARD_WHO = 'Mirror Backup'
 
 
 def main(argv: list[str]) -> int:
@@ -65,7 +74,15 @@ def main(argv: list[str]) -> int:
 # ── status ──
 
 def print_status(as_json: bool) -> int:
-    data = snap.snapshot(load_jobs())
+    # The destinations may be FUSE; a read in flight at the freeze aborts the
+    # suspend. Hold logind off for the read, or do not read at all.
+    try:
+        with guarded_read(GUARD_WHO, 'Reading backup status'):
+            data = snap.snapshot(load_jobs())
+    except SuspendInProgress:
+        print('mirror-backup: a suspend is under way, not reading the destinations',
+              file=sys.stderr)
+        return EXIT_SUSPENDING
     if as_json:
         print(json.dumps(data, ensure_ascii=False))
         return 0
@@ -91,37 +108,119 @@ def print_status(as_json: bool) -> int:
 
 
 def watch_status() -> int:
-    """Print the snapshot as one JSON line now and after every change.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    return StatusWatch(sys.stdout).run()
+
+
+class StatusWatch:
+    """`status --watch`: print the snapshot as one JSON line now and after
+    every change.
 
     State files are polled — they may sit on NFS, where inotify misses writes
     from other machines — every second while something runs and every five
     otherwise. Timer info (one systemctl call) refreshes each minute and
     whenever a job changes state.
+
+    Polls run on a GLib main loop so a suspend is handled between two of them:
+    a SleepGuard stops polling when one is announced and resumes after wake
+    (services/sleep_guard.py says why that matters for FUSE destinations).
     """
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    jobs, jobs_mtime = load_jobs(), _mtime(paths.jobs_file())
-    timers, timers_at = snap.timer_info([j['id'] for j in jobs]), time.monotonic()
-    last_line, last_states = None, None
-    while True:
+
+    ACTIVE_S = 1
+    IDLE_S = 5
+    TIMERS_S = 60
+
+    def __init__(self, out, *, guard_connection=None, logind_name: str = LOGIND_NAME):
+        self._out = out
+        self._loop = GLib.MainLoop()
+        self._source: int | None = None
+        self._signal_sources: list[int] = []
+        self._asleep = False
+        self._jobs: list[dict] = []
+        self._jobs_mtime: float | None = None
+        self._timers: dict = {}
+        self._timers_at = 0.0
+        self._last_line: str | None = None
+        self._last_states: list | None = None
+        self._guard = SleepGuard(self._on_sleep, self._on_wake, who=GUARD_WHO,
+                                 why='Pausing the status watch before suspend',
+                                 connection=guard_connection, name=logind_name)
+
+    @property
+    def polling(self) -> bool:
+        return self._source is not None
+
+    def run(self) -> int:
+        self.start()
+        try:
+            self._loop.run()
+        finally:
+            self.stop()
+        return 0
+
+    def start(self) -> None:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            self._signal_sources.append(
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, self._quit))
+        self._guard.start()
+        if not self._asleep:
+            self._schedule(0)
+
+    def stop(self) -> None:
+        self._unschedule()
+        for source in self._signal_sources:
+            GLib.source_remove(source)
+        self._signal_sources = []
+        self._guard.stop()
+
+    def poll(self) -> float:
+        """One round: print what changed; returns the seconds until the next."""
         mtime = _mtime(paths.jobs_file())
-        if mtime != jobs_mtime:
-            jobs, jobs_mtime = load_jobs(), mtime
-            timers_at = 0.0
-        data = snap.snapshot(jobs, timers={})
+        if mtime != self._jobs_mtime:
+            self._jobs, self._jobs_mtime = load_jobs(), mtime
+            self._timers_at = 0.0
+        data = snap.snapshot(self._jobs, timers={})
         states = [(j['id'], j['status']['state']) for j in data['jobs']]
-        if states != last_states or time.monotonic() - timers_at > 60:
-            timers, timers_at = snap.timer_info([j['id'] for j in jobs]), time.monotonic()
-            last_states = states
+        if states != self._last_states or time.monotonic() - self._timers_at > self.TIMERS_S:
+            self._timers = snap.timer_info([j['id'] for j in self._jobs])
+            self._timers_at = time.monotonic()
+            self._last_states = states
         for job in data['jobs']:
-            info = timers.get(job['id'], {})
+            info = self._timers.get(job['id'], {})
             job['next_run'] = info.get('next_run', '')
             job['timer_enabled'] = info.get('timer_enabled', False)
         line = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        if line != last_line:
-            print(line, flush=True)
-            last_line = line
+        if line != self._last_line:
+            print(line, file=self._out, flush=True)
+            self._last_line = line
         active = any(s in ('running', 'scanning', 'paused', 'queued') for _, s in states)
-        time.sleep(1 if active else 5)
+        return self.ACTIVE_S if active else self.IDLE_S
+
+    def _tick(self) -> bool:
+        self._source = None
+        self._schedule(self.poll())
+        return GLib.SOURCE_REMOVE
+
+    def _schedule(self, seconds: float) -> None:
+        self._unschedule()
+        self._source = GLib.timeout_add(int(seconds * 1000), self._tick)
+
+    def _unschedule(self) -> None:
+        if self._source is not None:
+            GLib.source_remove(self._source)
+            self._source = None
+
+    def _on_sleep(self) -> None:
+        self._asleep = True
+        self._unschedule()
+
+    def _on_wake(self) -> None:
+        self._asleep = False
+        self._schedule(0)
+
+    def _quit(self) -> bool:
+        self._loop.quit()
+        return GLib.SOURCE_CONTINUE     # stop() removes the signal sources
 
 
 def _mtime(path: Path) -> float:

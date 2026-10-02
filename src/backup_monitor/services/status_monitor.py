@@ -10,6 +10,7 @@ from backup_monitor import paths
 from backup_monitor.models.job import BackupJob
 from backup_monitor.models.job_history import last_run
 from backup_monitor.services import systemd_service
+from backup_monitor.services.sleep_guard import LOGIND_NAME, SleepGuard
 
 
 class StatusMonitor(GObject.Object):
@@ -18,6 +19,11 @@ class StatusMonitor(GObject.Object):
     Status files live in the destinations, often on NFS: inotify there only
     sees writes made by this machine, so the one-second poll stays the ground
     truth and the monitors merely make local changes show up sooner.
+
+    Nothing is read while a suspend is announced: a SleepGuard pauses the
+    polls between two of them and resumes them after wake (a read of a FUSE
+    destination in flight at the freeze would abort the suspend — see
+    sleep_guard.py).
     """
 
     __gsignals__ = {
@@ -27,20 +33,35 @@ class StatusMonitor(GObject.Object):
     POLL_INTERVAL_MS = 1000
     TIMER_POLL_INTERVAL_S = 30  # Timer info changes slowly, poll less often
 
-    def __init__(self, jobs: list[BackupJob]):
+    def __init__(self, jobs: list[BackupJob], *, guard_connection=None,
+                 logind_name: str = LOGIND_NAME):
         super().__init__()
         self._jobs = jobs
         self._poll_id = None
         self._timer_poll_id = None
         self._file_monitors = []
         self._states: dict[str, str] = {}
+        self._asleep = False
+        self._guard = SleepGuard(self._on_sleep, self._on_wake, who='Mirror Backup',
+                                 why='Pausing status polling before suspend',
+                                 connection=guard_connection, name=logind_name)
 
     @property
     def jobs(self) -> list[BackupJob]:
         return self._jobs
 
+    @property
+    def polling(self) -> bool:
+        return self._poll_id is not None
+
     def start(self):
         """Start polling and file monitoring."""
+        self._guard.start()
+        if not self._asleep:
+            self._resume()
+
+    def _resume(self):
+        self._pause()
         self._refresh_statuses()
         self._refresh_timer_info()
 
@@ -50,6 +71,10 @@ class StatusMonitor(GObject.Object):
         self._timer_poll_id = GLib.timeout_add_seconds(
             self.TIMER_POLL_INTERVAL_S, self._on_timer_poll)
 
+        if not self._file_monitors:
+            self._watch_state_dirs()
+
+    def _watch_state_dirs(self):
         for job in self._jobs:
             state_dir = paths.job_paths(job.destination).state_dir
             if not state_dir.is_dir():
@@ -64,15 +89,27 @@ class StatusMonitor(GObject.Object):
 
     def stop(self):
         """Stop all monitoring."""
+        self._pause()
+        for monitor in self._file_monitors:
+            monitor.cancel()
+        self._file_monitors = []
+        self._guard.stop()
+
+    def _pause(self):
         if self._poll_id:
             GLib.source_remove(self._poll_id)
             self._poll_id = None
         if self._timer_poll_id:
             GLib.source_remove(self._timer_poll_id)
             self._timer_poll_id = None
-        for monitor in self._file_monitors:
-            monitor.cancel()
-        self._file_monitors = []
+
+    def _on_sleep(self):
+        self._asleep = True
+        self._pause()
+
+    def _on_wake(self):
+        self._asleep = False
+        self._resume()
 
     def _on_poll(self) -> bool:
         self._refresh_statuses()
@@ -83,6 +120,8 @@ class StatusMonitor(GObject.Object):
         return GLib.SOURCE_CONTINUE
 
     def _on_file_changed(self, monitor, file, other_file, event_type):
+        if self._asleep:
+            return
         if event_type in (Gio.FileMonitorEvent.CHANGED, Gio.FileMonitorEvent.CREATED):
             self._refresh_statuses()
 

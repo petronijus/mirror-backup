@@ -10,9 +10,12 @@
 # The app lives in ${XDG_DATA_HOME:-~/.local/share}/mirror-backup/app — put
 # there by install.sh, or by the GNOME extension on its first run.
 set -euo pipefail
+# The system interpreter: PyGObject (gi) comes from the distribution's packages
+# and is missing from Homebrew/pyenv pythons that may come first in PATH.
+PYTHON="${MIRROR_BACKUP_PYTHON:-/usr/bin/python3}"
 APP_DIR="${MIRROR_BACKUP_APP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mirror-backup/app}"
 if [[ ! -d "$APP_DIR/backup_monitor" ]]; then
     echo "mirror-backup: the app is not installed in $APP_DIR (run install.sh)" >&2
     exit 1
 fi
-PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m backup_monitor "$@"
+PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}" exec "$PYTHON" -m backup_monitor "$@"

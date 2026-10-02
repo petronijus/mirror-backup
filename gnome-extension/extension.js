@@ -3,6 +3,7 @@ import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 
+import * as LoginManager from 'resource:///org/gnome/shell/misc/loginManager.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -18,6 +19,10 @@ const APP_HOME = GLib.build_filenamev([GLib.get_user_data_dir(), 'mirror-backup'
 // runs, lazily otherwise. Opening the menu always asks at once.
 const POLL_ACTIVE_S = 3;
 const POLL_IDLE_S = 15;
+
+// `mirror-backup status` exits with this when a suspend is already under way:
+// it read nothing, which is no error to show.
+const EXIT_SUSPENDING = 75;
 
 // Read the user's jobs from jobs.json (the same source the desktop app uses)
 // so the menu can be built before the first status arrives.
@@ -56,7 +61,8 @@ function _runSystemctlAsync(args, callback) {
 
 // Every job's state, as `mirror-backup status --json` reports it. The rules
 // for where a job's state lives (its destination) and when a run counts as
-// alive are the app's; the panel only displays the result.
+// alive are the app's; the panel only displays the result. Calls back with
+// neither a snapshot nor an error when the command skipped a pending suspend.
 function _fetchSnapshot(cancellable, callback) {
     try {
         const proc = Gio.Subprocess.new(
@@ -66,6 +72,10 @@ function _fetchSnapshot(cancellable, callback) {
         proc.communicate_utf8_async(null, cancellable, (_proc, res) => {
             try {
                 const [, stdout, stderr] = _proc.communicate_utf8_finish(res);
+                if (_proc.get_if_exited() && _proc.get_exit_status() === EXIT_SUSPENDING) {
+                    callback(null, null);
+                    return;
+                }
                 if (!_proc.get_successful()) {
                     callback(null, stderr?.trim() || 'mirror-backup status failed');
                     return;
@@ -494,7 +504,29 @@ export default class BackupMonitorExtension extends Extension {
         this._cancellable = new Gio.Cancellable();
         this._fetching = false;
         this._pollId = null;
+
+        // Destinations may be FUSE: a status read in flight when userspace is
+        // frozen aborts the suspend. Stop polling once one is announced (a
+        // read already running holds logind off by itself) and pick up again
+        // after wake.
+        this._asleep = false;
+        this._loginManager = LoginManager.getLoginManager();
+        this._sleepId = this._loginManager.connect('prepare-for-sleep',
+            (_lm, aboutToSuspend) => this._onPrepareForSleep(aboutToSuspend));
+
         this._refresh();
+    }
+
+    _onPrepareForSleep(aboutToSuspend) {
+        this._asleep = aboutToSuspend;
+        if (aboutToSuspend) {
+            if (this._pollId) {
+                GLib.source_remove(this._pollId);
+                this._pollId = null;
+            }
+        } else {
+            this._refresh();
+        }
     }
 
     _rebuildSections(jobs) {
@@ -618,6 +650,11 @@ export default class BackupMonitorExtension extends Extension {
     }
 
     disable() {
+        if (this._sleepId) {
+            this._loginManager.disconnect(this._sleepId);
+            this._sleepId = null;
+        }
+        this._loginManager = null;
         this._unwatchTrayPos();
         this._stopPulse();
         this._cancellable?.cancel();
@@ -641,6 +678,8 @@ export default class BackupMonitorExtension extends Extension {
     _schedulePoll(seconds) {
         if (this._pollId)
             GLib.source_remove(this._pollId);
+        this._pollId = null;
+        if (this._asleep) return;
         this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
             this._pollId = null;
             this._refresh();
@@ -649,11 +688,15 @@ export default class BackupMonitorExtension extends Extension {
     }
 
     _refresh() {
-        if (this._fetching || !this._cancellable) return;
+        if (this._fetching || !this._cancellable || this._asleep) return;
         this._fetching = true;
         _fetchSnapshot(this._cancellable, (snap, error) => {
             this._fetching = false;
             if (!this._indicator) return;
+            if (!snap && !error) {     // skipped for a suspend; wake polls again
+                this._schedulePoll(POLL_IDLE_S);
+                return;
+            }
             const anyActive = this._apply(snap, error);
             this._schedulePoll(anyActive ? POLL_ACTIVE_S : POLL_IDLE_S);
         });
