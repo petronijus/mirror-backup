@@ -78,8 +78,21 @@ ERROR_MSG=""
 SCAN_READ=""
 FINISHED=0
 IS_PAUSED=0
-SEEN_PROGRESS=0
 CONSECUTIVE_FAILURES=0
+# Where the run is — see the progress filter below for the phases.
+PHASE=""
+PHASE_DONE=0
+PHASE_TOTAL=0      # 0 = not known
+PHASE_ESTIMATED=0  # 1 when PHASE_TOTAL is the previous run's count
+PHASE_SEEN_EPOCH=0 # first sighting of the phase and its count then, for the ETA
+PHASE_SEEN_DONE=0
+COMPARED=0         # 1 once rsync compares files (state "running" from then on)
+DIRS_SEEN=0
+EST_FILES=0        # the previous successful run's file-list size …
+EST_DIRS=0         # … and directory count, totals for the phases that have none
+TRANSFER_SEQ=""    # rsync's transfer-progress line counter …
+TRANSFER_EPOCH=0   # … and when it last moved: the speed is shown while it is fresh
+PROGRESS_EOF=0
 SUGGESTED_EXCLUDES_JSON="[]"
 START_TIME="$(date -Iseconds)"
 START_EPOCH="$(date +%s)"
@@ -117,8 +130,9 @@ format_bytes() {
 
 write_status() {
     local state="$1"
-    local escaped_file escaped_error
+    local escaped_file escaped_error estimated=false
     (( STATE_OK )) || return 0
+    (( PHASE_ESTIMATED )) && estimated=true
     escaped_file=$(json_escape "${CURRENT_FILE:-}")
     escaped_error=$(json_escape "${ERROR_MSG:-}")
     cat > "${STATUS_FILE}.tmp" <<-JEOF
@@ -132,6 +146,10 @@ write_status() {
   "files_transferred": ${FILES_XFRD:-0},
   "files_total": ${FILES_TOTAL:-0},
   "files_remaining": ${FILES_REMAINING:-0},
+  "phase": "${PHASE:-}",
+  "phase_done": ${PHASE_DONE:-0},
+  "phase_total": ${PHASE_TOTAL:-0},
+  "phase_estimated": $estimated,
   "pid": $$,
   "rsync_pid": ${RSYNC_PID:-0},
   "started": "$START_TIME",
@@ -243,48 +261,163 @@ to_json_array() {
     printf '%s' "$out"
 }
 
-parse_progress() {
-    [[ -f "$PROGRESS_FILE" ]] || return 1
+# --- progress ---
+#
+# A run goes through up to three phases, and rsync's own progress line covers
+# none of them: it counts bytes copied against the size of everything, so an
+# incremental run of a big mirror sits at 0 % from start to end.
+#
+#   listing   the sender walks the source         --info=flist2: "N files..."
+#   deleting  a separate pass over the mirror's   --debug=del2: one
+#             directories (--delete-before/after)  "delete_in_dir(dir)" each
+#   checking  every entry of the file list is     -ii: one itemize line per
+#             compared, and copied when it changed entry, unchanged ones too
+#
+# The filter below follows that output and appends a snapshot line to
+# $PROGRESS_FILE for every message it counts; the status tick reads the last
+# one (read_progress). A snapshot per message, not per so many: rsync can go
+# quiet for minutes on a slow mount, and the count shown must be the one it
+# stopped at. The file starts over every 20000 lines. Counting happens in awk
+# because a run names every one of millions of files. Fields are separated by
+# the unit separator (\x1f): rsync escapes control characters in the names it
+# itemizes, and unlike a tab it keeps empty fields apart when bash reads them.
+PROGRESS_AWK='
+function dump(eof) {
+    if (written++ >= 20000) { close(out); written = 1 }   # reopened, it starts empty
+    printf "%s\037%d\037%d\037%d\037%d\037%s\037%d\037%d\037%s\037end\n", \
+        phase, done, files_total, dirs, xfr, speed, p2n, eof, current > out
+    fflush(out)
+}
+function enter(p) { phase = p; done = 0; current = ""; dump(0) }
+BEGIN { phase = "listing"; dump(0) }
+/^ *[0-9]+ files\.\.\.$/ { done = $1 + 0; dump(0); next }
+/^[0-9]+ files to consider$/ { files_total = $1 + 0; enter("checking"); next }
+/^deleting in / { enter("deleting"); next }
+/^delete_in_dir\(/ {
+    if (phase != "deleting") next   # --delete-during: part of the comparison
+    done++
+    current = substr($0, 15, length($0) - 15)
+    dump(0)
+    next
+}
+/^[<>ch.][fdLDS]......... / {
+    if (phase != "checking") enter("checking")
+    done++
+    if (substr($0, 2, 1) == "d") dirs++
+    current = substr($0, 13)
+    if (substr($0, 2, 1) == "L") sub(/ -> .*$/, "", current)
+    dump(0)
+    next
+}
+/^ +[0-9][^ ]* +[0-9]+% / {
+    speed = $3; p2n++
+    if (match($0, /xfr#[0-9]+/)) xfr = substr($0, RSTART + 4, RLENGTH - 4) + 0
+    dump(0)
+    next
+}
+END { dump(1) }
+'
 
-    local recent last_progress last_file
-    recent=$(tail -50 "$PROGRESS_FILE" 2>/dev/null) || return 1
-    [[ -z "$recent" ]] && return 1
+# mawk reads a pipe in whole blocks unless it runs interactive, which would
+# hold the snapshot back by thousands of lines; gawk passes lines on as they come.
+PROGRESS_FILTER=(awk)
+case "$(awk -W version 2>&1)" in
+    mawk*) PROGRESS_FILTER=(awk -W interactive) ;;
+esac
+PROGRESS_FILTER+=(-v "out=$PROGRESS_FILE" "$PROGRESS_AWK")
 
-    last_progress=$(echo "$recent" | grep -E '[0-9]+%.*B/s' | tail -1) || true
-    last_file=$(echo "$recent" | grep -vE '^[[:space:]]*$|[0-9]+%|^sending |^receiving |^total |^sent |^created |^building ' | tail -1) || true
+# The filter's last snapshot into the status variables. Returns 1 while there
+# is none yet, or when the file was caught starting over or mid-line.
+read_progress() {
+    local line phase done files_total dirs xfr speed p2n eof current end
+    local now permille left
+    line=$(tail -n 1 "$PROGRESS_FILE" 2>/dev/null) || return 1
+    IFS=$'\x1f' read -r phase done files_total dirs xfr speed p2n eof current end <<< "$line"
+    [[ "$end" == end ]] || return 1
+    printf -v now '%(%s)T' -1
 
-    if [[ -n "$last_progress" ]]; then
-        if [[ "$last_progress" =~ ([0-9]+)%[[:space:]]+([^[:space:]]+/s)[[:space:]]+([0-9:]+) ]]; then
-            LAST_PCT="${BASH_REMATCH[1]}"
-            LAST_SPEED="${BASH_REMATCH[2]}"
-            LAST_ETA="${BASH_REMATCH[3]}"
-        fi
+    if [[ "$phase" != "$PHASE" ]]; then
+        PHASE=$phase
+        PHASE_SEEN_EPOCH=$now
+        PHASE_SEEN_DONE=$done
+    fi
+    PHASE_DONE=$done
+    FILES_TOTAL=$files_total
+    FILES_XFRD=$xfr
+    DIRS_SEEN=$dirs
+    CURRENT_FILE=$current
+    PROGRESS_EOF=$eof
+    [[ "$PHASE" == checking ]] && COMPARED=1
 
-        if [[ "$last_progress" =~ xfr#([0-9]+),[[:space:]]*(to-chk|ir-chk)=([0-9]+)/([0-9]+) ]]; then
-            FILES_XFRD="${BASH_REMATCH[1]}"
-            FILES_REMAINING="${BASH_REMATCH[3]}"
-            FILES_TOTAL="${BASH_REMATCH[4]}"
-        fi
+    PHASE_ESTIMATED=0
+    case "$PHASE" in
+        listing)
+            PHASE_TOTAL=$EST_FILES PHASE_ESTIMATED=1 ;;
+        deleting)
+            # After the comparison (--delete-after) this run has counted the
+            # directories itself; before it, the previous run's count stands in.
+            if (( COMPARED && DIRS_SEEN )); then
+                PHASE_TOTAL=$DIRS_SEEN
+            else
+                PHASE_TOTAL=$EST_DIRS PHASE_ESTIMATED=1
+            fi ;;
+        checking)
+            PHASE_TOTAL=$FILES_TOTAL
+            FILES_REMAINING=$(( FILES_TOTAL > PHASE_DONE ? FILES_TOTAL - PHASE_DONE : 0 )) ;;
+        *)
+            PHASE_TOTAL=0 ;;
+    esac
+    (( PHASE_TOTAL )) || PHASE_ESTIMATED=0
 
-        [[ -n "$last_file" ]] && CURRENT_FILE="$last_file"
-        return 0
+    LAST_PCT=0
+    if (( PHASE_TOTAL )); then
+        permille=$(( PHASE_DONE * 1000 / PHASE_TOTAL ))
+        (( permille <= 1000 )) || permille=1000
+        # An estimate is off either way; it never claims the phase finished.
+        (( ! PHASE_ESTIMATED || permille <= 990 )) || permille=990
+        LAST_PCT="$((permille / 10)).$((permille % 10))"
     fi
 
-    if [[ -n "$last_file" ]]; then
-        CURRENT_FILE="$last_file"
-        return 0
+    # From the average pace since the phase was first seen (or resumed).
+    LAST_ETA=""
+    if (( PHASE_TOTAL > PHASE_DONE && PHASE_DONE > PHASE_SEEN_DONE && now - PHASE_SEEN_EPOCH >= 10 )); then
+        left=$(( (PHASE_TOTAL - PHASE_DONE) * (now - PHASE_SEEN_EPOCH) / (PHASE_DONE - PHASE_SEEN_DONE) ))
+        printf -v LAST_ETA '%d:%02d:%02d' $((left / 3600)) $((left % 3600 / 60)) $((left % 60))
     fi
 
-    return 1
+    # rsync repeats its transfer line only while it copies; a speed from a
+    # copy that ended minutes ago would describe nothing.
+    if [[ "$p2n" != "$TRANSFER_SEQ" ]]; then
+        TRANSFER_SEQ=$p2n
+        TRANSFER_EPOCH=$now
+    fi
+    LAST_SPEED=""
+    (( now - TRANSFER_EPOCH > 10 )) || LAST_SPEED=$speed
+    return 0
 }
 
-truncate_progress_file() {
-    local fsize
-    fsize=$(stat -c%s "$PROGRESS_FILE" 2>/dev/null) || return 0
-    if (( fsize > 1048576 )); then
-        tail -100 "$PROGRESS_FILE" > "${PROGRESS_FILE}.tmp" 2>/dev/null
-        mv -f "${PROGRESS_FILE}.tmp" "$PROGRESS_FILE" 2>/dev/null || true
+# "scanning" until rsync compares files, "running" from then on.
+write_active_status() {
+    if (( COMPARED )); then
+        write_status "running"
+    else
+        write_status "scanning"
     fi
+}
+
+# Totals of the previous successful run, "<files> <dirs>": the source listing
+# and a delete pass report no total of their own, and a mirror changes little
+# between runs.
+previous_totals() {
+    [[ -f "$HISTORY_FILE" ]] || return 0
+    awk '/"exit_code":[[:space:]]*0[,}]/ && /"files_total":[[:space:]]*[1-9]/ { line = $0 }
+        END {
+            if (line == "") exit
+            f = line; sub(/.*"files_total":[[:space:]]*/, "", f); sub(/[^0-9].*/, "", f)
+            d = 0
+            if (line ~ /"dirs_total":/) { d = line; sub(/.*"dirs_total":[[:space:]]*/, "", d); sub(/[^0-9].*/, "", d) }
+            print f + 0, d + 0
+        }' "$HISTORY_FILE"
 }
 
 # --- stopping rsync / postponing the run ---
@@ -531,7 +664,10 @@ resume_rsync() {
     # shellcheck disable=SC2046
     kill -CONT "$RSYNC_PID" $(descendants "$RSYNC_PID") 2>/dev/null || true
     IS_PAUSED=0
-    write_status "running"
+    # The pause says nothing about rsync's pace: the ETA starts measuring anew.
+    printf -v PHASE_SEEN_EPOCH '%(%s)T' -1
+    PHASE_SEEN_DONE=$PHASE_DONE
+    write_active_status
 }
 
 handle_signals() {
@@ -756,7 +892,10 @@ esac
 
 RSYNC_ARGS=(
     -a
-    --info=progress2,name1
+    # What the progress filter counts: see "progress" above.
+    --info=progress2,flist2
+    --debug=del2
+    --itemize-changes --itemize-changes
     --no-inc-recursive
     --human-readable
     --outbuf=L
@@ -828,20 +967,18 @@ fi
 
 # --- go ---
 
-# Every tick while rsync runs: turn its progress output into the status file.
+# Every tick while rsync runs: turn its progress into the status file.
 rsync_tick() {
     [[ "$IS_PAUSED" -eq 0 ]] || return 0
-    if parse_progress; then
-        SEEN_PROGRESS=1
-        write_status "running"
-    elif [[ "$SEEN_PROGRESS" -eq 0 ]]; then
-        if [[ -r "/proc/$RSYNC_PID/io" ]]; then
-            SCAN_READ=$(format_bytes "$(awk '/^read_bytes:/ {print $2}' "/proc/$RSYNC_PID/io" 2>/dev/null || echo 0)")
-        fi
-        write_status "scanning"
+    read_progress || true
+    if (( ! COMPARED )) && [[ -r "/proc/$RSYNC_PID/io" ]]; then
+        SCAN_READ=$(format_bytes "$(awk '/^read_bytes:/ {print $2}' "/proc/$RSYNC_PID/io" 2>/dev/null || echo 0)")
     fi
-    truncate_progress_file
+    write_active_status
 }
+
+read -r EST_FILES EST_DIRS < <(previous_totals) || true
+EST_FILES=${EST_FILES:-0} EST_DIRS=${EST_DIRS:-0}
 
 echo "$$ " > "$PID_FILE"
 notify "🔄 $JOB_NAME" "$SRC → $DST"
@@ -849,13 +986,15 @@ start_sleep_guard
 
 while :; do
     LAST_PCT=0 LAST_SPEED="" LAST_ETA="" CURRENT_FILE="" SCAN_READ=""
-    FILES_XFRD=0 FILES_TOTAL=0 FILES_REMAINING=0 SEEN_PROGRESS=0
+    FILES_XFRD=0 FILES_TOTAL=0 FILES_REMAINING=0 DIRS_SEEN=0 COMPARED=0
+    PHASE="" PHASE_DONE=0 PHASE_TOTAL=0 PHASE_ESTIMATED=0 PROGRESS_EOF=0
+    TRANSFER_SEQ="" TRANSFER_EPOCH=0
     write_status "scanning"
     echo "=== $START_TIME === $JOB_NAME: $SRC → $DST ===" >> "$LOG_FILE"
 
     rm -f "$PROGRESS_FILE"
     rsync "${RSYNC_ARGS[@]}" "$SRC" "$DST" \
-        > >(stdbuf -oL tr '\r' '\n' > "$PROGRESS_FILE") \
+        > >(stdbuf -oL tr '\r' '\n' | "${PROGRESS_FILTER[@]}") \
         2>> "$LOG_FILE" &
     RSYNC_PID=$!
     echo "$$ $RSYNC_PID" > "$PID_FILE"
@@ -875,9 +1014,11 @@ while :; do
     notify "🔄 $JOB_NAME" "Restarting after wake"
 done
 
-# Read any remaining output after rsync exits
-sleep 0.5
-parse_progress || true
+# The filter writes its last snapshot once rsync's output has ended.
+for _ in {1..50}; do
+    if read_progress && (( PROGRESS_EOF )); then break; fi
+    sleep 0.1
+done
 
 # Capture rsync exit code without tripping `set -e` on non-zero (e.g. 23 = partial)
 RSYNC_EXIT=0
@@ -894,6 +1035,9 @@ prune_archive() {
 }
 
 if [[ "$ARCHIVE_DAYS" -gt 0 && -d "$DST/.archive" ]]; then
+    PHASE=pruning PHASE_DONE=0 PHASE_TOTAL=0 PHASE_ESTIMATED=0
+    LAST_PCT=0 LAST_SPEED="" LAST_ETA="" CURRENT_FILE=""
+    write_status "running"
     # The destination can be a FUSE mount too, so pruning runs under the same
     # suspend guard; stopped halfway, it simply runs again after wake.
     while :; do
@@ -912,6 +1056,7 @@ stop_sleep_guard
 
 FINISHED=1
 FINAL_STATE="idle"
+PHASE="" PHASE_DONE=0 PHASE_TOTAL=0 PHASE_ESTIMATED=0 LAST_SPEED="" LAST_ETA=""
 if [[ "$RSYNC_EXIT" -eq 0 || "$RSYNC_EXIT" -eq 23 || "$RSYNC_EXIT" -eq 24 ]]; then
     LAST_PCT=100
     CURRENT_FILE=""
@@ -926,6 +1071,7 @@ else
     ERROR_MSG=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -v '^===' | head -3 | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//') || true
     FINAL_STATE="error"
     HISTORY_EXIT="$RSYNC_EXIT"
+    DIRS_SEEN=0   # a comparison cut short counted only part of them
 fi
 
 # --- write history entry (must happen before streak compute) ---
@@ -933,9 +1079,9 @@ fi
 FINISH_TIME="$(date -Iseconds)"
 FINISH_EPOCH="$(date +%s)"
 DURATION_SEC=$(( FINISH_EPOCH - START_EPOCH ))
-printf '{"started":"%s","finished":"%s","duration_sec":%d,"exit_code":%d,"files_transferred":%d,"files_total":%d,"error":"%s","host":"%s"}\n' \
+printf '{"started":"%s","finished":"%s","duration_sec":%d,"exit_code":%d,"files_transferred":%d,"files_total":%d,"dirs_total":%d,"error":"%s","host":"%s"}\n' \
     "$START_TIME" "$FINISH_TIME" "$DURATION_SEC" "$HISTORY_EXIT" \
-    "${FILES_XFRD:-0}" "${FILES_TOTAL:-0}" \
+    "${FILES_XFRD:-0}" "${FILES_TOTAL:-0}" "${DIRS_SEEN:-0}" \
     "$(json_escape "${ERROR_MSG:-}")" "$(json_escape "$HOST")" \
     >> "$HISTORY_FILE"
 

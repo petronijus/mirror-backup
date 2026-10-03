@@ -260,31 +260,27 @@ class JobCard(Gtk.Box):
             else:
                 self._progress_bar.remove_css_class('bm-progress-paused')
 
-        # Detail rows
+        # Detail rows: what the run is at, then how far it has got
         self._detail_box.set_visible(is_active)
         if is_active:
-            if state == 'scanning':
-                self._file_label.set_label('Building file list\u2026')
-                parts = []
-                if st.scan_read:
-                    parts.append(f'{st.scan_read} read')
-                self._stats_label.set_label('  \u00b7  '.join(parts))
+            if st.phase_label:
+                headline = st.phase_label
+            elif st.current_file:
+                headline = self._shorten_path(st.current_file)
             else:
-                if st.current_file:
-                    self._file_label.set_label(self._shorten_path(st.current_file))
-                else:
-                    self._file_label.set_label('')
+                headline = 'Building file list\u2026' if state == 'scanning' else ''
+            self._file_label.set_label(headline)
 
-                parts = []
-                if st.progress > 0:
-                    parts.append(f'{st.progress:.0f}%')
-                if st.speed:
-                    parts.append(st.speed)
-                if st.eta and st.eta != '0:00:00':
-                    parts.append(f'ETA {st.eta}')
-                if st.files_total > 0:
-                    parts.append(f'{st.files_transferred}/{st.files_total} files')
-                self._stats_label.set_label('  \u00b7  '.join(parts))
+            parts = [p for p in (st.progress_text, st.speed) if p]
+            if st.eta and st.eta != '0:00:00':
+                parts.append(f'ETA {st.eta}')
+            if st.phase_count:
+                parts.append(st.phase_count)
+            elif st.files_total > 0:   # written by a backup-sync without phases
+                parts.append(f'{st.files_transferred}/{st.files_total} files')
+            if state == 'scanning' and not st.phase and st.scan_read:
+                parts.append(f'{st.scan_read} read')
+            self._stats_label.set_label('  \u00b7  '.join(parts))
 
         # Schedule info — live countdown
         countdown = format_countdown(self._job.next_run)

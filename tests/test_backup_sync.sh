@@ -37,6 +37,16 @@ new_case() {
 }
 
 run_sync() { "$SYNC" "test-job" "$SRC" "$DST" "" 0 >"$CASE/out" 2>&1; echo $?; }
+last_history() { tail -1 "$STATE/history.jsonl" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"; }
+# wait_for <expression over the status d>: polls the status file for up to 10 s
+wait_for() {
+    local _
+    for _ in $(seq 100); do
+        [[ $(json "$STATE/status.json" "$1" 2>/dev/null) == True ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
 
 # ── a normal run ──
 new_case normal-run
@@ -49,6 +59,9 @@ check "status is valid JSON, idle, 100 %" '[[ $(json "$STATE/status.json" "d[\"s
 check "status names host and boot" '[[ $(json "$STATE/status.json" "d[\"host\"]") == "$(uname -n)" && $(json "$STATE/status.json" "d[\"boot_id\"]") == "$(cat /proc/sys/kernel/random/boot_id)" ]]'
 check "history entry carries the host" '[[ $(tail -1 "$STATE/history.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin)[\"host\"])") == "$(uname -n)" ]]'
 check "no runtime leftovers" '[[ -z $(ls -A "$XDG_RUNTIME_DIR/backup-sync" | grep -v "^queue.lock$") ]]'
+check "finished status names no phase" '[[ $(json "$STATE/status.json" "d[\"phase\"], d[\"phase_total\"]") == "('"''"', 0)" ]]'
+# ./, a.txt, sub/ and the file in it — every entry, and the two directories
+check "history counts the file list and its directories" '[[ $(last_history "d[\"files_total\"], d[\"dirs_total\"]") == "(4, 2)" ]]'
 
 # ── --delete keeps the state, removes the rest ──
 echo stale > "$CASE/dst/stale.txt"
@@ -130,6 +143,50 @@ printf '{"started":"%s","finished":"%s","duration_sec":1,"exit_code":12,"files_t
     "$(date -d '-1 minute' -Iseconds)" "$(date -Iseconds)" > "$CASE/dst/.mirror-backup/history.jsonl"
 rc=$(TRIGGER_UNIT=test-job.timer BACKUP_SYNC_SCHEDULE='2099-01-01 00:00:00' run_sync)
 check "a failed last run does not cover the slot" '[[ $rc == 0 && -f "$CASE/dst/a.txt" ]]'
+
+# ── progress through the phases ──
+# A stand-in rsync prints what the real one prints in each phase (rsync -ii
+# --info=progress2,flist2 --debug=del2), and moves on only when the test has
+# seen the status of the phase.
+new_case phases
+STATE="$CASE/dst/.mirror-backup"
+mkdir -p "$TMP/bin" "$STATE" "$CASE/gate"
+printf '{"started":"2020-01-01T00:00:00+00:00","finished":"2020-01-01T00:01:00+00:00","duration_sec":60,"exit_code":0,"files_transferred":0,"files_total":4000,"dirs_total":40,"error":""}\n' \
+    > "$STATE/history.jsonl"
+cat > "$TMP/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+step() { for _ in $(seq 600); do [[ -e "$GATE/$1" ]] && return; sleep 0.05; done; exit 99; }
+printf 'building file list ... \n'
+for n in $(seq 0 100 3000); do printf ' %d files...\r' "$n"; done
+step listed
+printf '4100 files to consider\ndeleting in .\n'
+for d in $(seq 10); do printf 'delete_in_dir(dir%d)\n' "$d"; done
+printf 'delete_item(dir3/old) mode=100644 flags=2\n*deleting   dir3/old\n'
+step deleted
+printf '.d          ./\n'
+for f in $(seq 2049); do printf '.f          dir%d/file%d\n' $((f % 40)) "$f"; done
+printf '>f+++++++++ dir7/new file\n'
+printf '         12.34K   0%%    1.23MB/s    0:00:01 (xfr#1, to-chk=2049/4100)\n'
+step compared
+EOF
+chmod +x "$TMP/bin/rsync"
+PATH="$TMP/bin:$PATH" GATE="$CASE/gate" "$SYNC" test-job "$SRC" "$DST" "" 0 >"$CASE/out" 2>&1 &
+SYNC_PID=$!
+listing='(d["state"], d["phase"], d["phase_done"], d["phase_total"], d["phase_estimated"], d["progress"]) == ("scanning", "listing", 3000, 4000, True, 75.0)'
+check "listing: counted against the previous run's file list" 'wait_for "$listing"'
+touch "$CASE/gate/listed"
+deleting='(d["state"], d["phase"], d["phase_done"], d["phase_total"], d["phase_estimated"], d["progress"], d["current_file"]) == ("scanning", "deleting", 10, 40, True, 25.0, "dir10")'
+check "deleting: directories against the previous run's count" 'wait_for "$deleting"'
+touch "$CASE/gate/deleted"
+checking='(d["state"], d["phase"], d["phase_done"], d["phase_total"], d["phase_estimated"], d["progress"], d["files_total"], d["files_remaining"]) == ("running", "checking", 2051, 4100, False, 50.0, 4100, 2049)'
+check "checking: every entry against this run's file list" 'wait_for "$checking"'
+copying='(d["current_file"], d["speed"], d["files_transferred"]) == ("dir7/new file", "1.23MB/s", 1)'
+check "names the file being copied, the speed and the copies" 'wait_for "$copying"'
+touch "$CASE/gate/compared"
+wait "$SYNC_PID"; rc=$?
+check "exits 0" '[[ $rc == 0 ]]'
+check "finished: idle, 100 %, no phase" '[[ $(json "$STATE/status.json" "d[\"state\"], d[\"progress\"], d[\"phase\"]") == "('"'"'idle'"'"', 100, '"''"')" ]]'
+check "history carries this run's totals" '[[ $(last_history "d[\"files_total\"], d[\"dirs_total\"]") == "(4100, 1)" ]]'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

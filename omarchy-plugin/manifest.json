@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "petronijus.mirror-backup",
   "name": "Mirror Backup",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": "Petr Parkan Janda",
   "license": "MIT",
   "description": "Mirror Backup's rsync jobs in the Omarchy bar: live progress, schedule, last run on any machine, start / pause / stop.",

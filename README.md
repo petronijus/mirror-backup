@@ -33,7 +33,7 @@ The GTK4/libadwaita desktop app provides full backup management:
 
 ### Dashboard
 - Real-time status cards for all backup jobs
-- Progress bars with speed, ETA, file counts
+- Progress through every phase of a run — reading the source, finding deleted files, comparing with the mirror — with ETA and file counts, speed while copying
 - Live countdown to next scheduled run (e.g. "in 2h 15m"), relative last-run time
 - Start/Pause/Resume/Stop controls
 - Click card → detail page, edit pencil → job editor
@@ -112,7 +112,7 @@ lives and when a run counts as alive exist once, in the app.
 
 - Panel icon with color-coded status (blue = running, yellow = paused, red = error, gray = queued, light blue = postponed)
 - Per-job controls: Start, Stop, Pause/Resume
-- Progress bar with speed and ETA
+- Progress bar with the phase, ETA, file counts and speed
 - Live countdown to next run per job
 - Pulsing icon when backups are active
 - Last run and where it ran ("last 2h ago on omarchy")
@@ -247,7 +247,7 @@ cat /mnt/backup/Documents/.mirror-backup/backup.log
 
 1. **Scheduling**: systemd timers trigger `backup-sync` at configured intervals
 2. **Queue**: `flock` ensures only one backup runs at a time; others wait in "queued" state
-3. **Sync**: `backup-sync` runs rsync with configurable options and tracks progress
+3. **Sync**: `backup-sync` runs rsync with configurable options and tracks progress (see [Progress](#progress))
 4. **Status**: Progress written to `<destination>/.mirror-backup/status.json`, with the host and boot that wrote it
 5. **History**: Each completed run appends to `<destination>/.mirror-backup/history.jsonl`
 6. **Panels**: The GNOME extension polls `mirror-backup status --json` (3 s while active, 15 s idle); the Omarchy widget keeps `mirror-backup status --watch` running
@@ -257,6 +257,32 @@ cat /mnt/backup/Documents/.mirror-backup/backup.log
 10. **Archive**: Deleted/changed files kept in `.archive/` with configurable retention
 11. **Resume**: `mirror-backup-resume.service` (once per user-manager start) runs `mirror-backup sync-units` and `mirror-backup resume`, which restarts postponed and interrupted runs
 12. **Notifications**: Desktop notifications on start, finish, pause, resume, suspend, and errors
+
+## Progress
+
+rsync's own progress line counts bytes copied against the size of everything,
+so an incremental run of a big mirror sits at 0 % from start to finish. On a
+slow destination (NFS) most of the time goes into walking the trees, not into
+copying. `backup-sync` therefore follows a run through its phases:
+
+| Phase | What rsync does | Counted from | Total |
+|-------|-----------------|--------------|-------|
+| `listing` | walks the source | `--info=flist2` (`N files...`) | the previous successful run's file list (estimate, shown as `~`) |
+| `deleting` | separate pass over the mirror's directories (`--delete-before`, `--delete-after`) | `--debug=del2` (`delete_in_dir(…)`) | the previous run's directory count (estimate); after the comparison, this run's own |
+| `checking` | compares every entry, copies what changed | `-ii`: one itemize line per entry, unchanged ones too | this run's file list, exact |
+| `pruning` | removes expired archives | — | — |
+
+The state is `scanning` until rsync starts comparing and `running` from then
+on. `status.json` carries `phase`, `phase_done`, `phase_total` and
+`phase_estimated`; `progress` is the phase's percentage, and the ETA comes from
+the phase's average pace. `mirror-backup status --json` adds the wording every
+panel shows (`phase_label`, `phase_count`, `progress_text`), so the app, the
+GNOME extension and the Omarchy widget say the same thing. Each history entry
+records `files_total` and `dirs_total`, the next run's estimates.
+
+An awk filter between rsync and `$XDG_RUNTIME_DIR/backup-sync/<job>.progress`
+does the counting: one short snapshot line per message, so the count shown is
+the one rsync stopped at even when it goes quiet on a slow mount.
 
 ## File Layout
 

@@ -133,6 +133,66 @@ class StatusRulesTest(Sandbox):
         self.assertEqual(read_status(str(d)).state, 'error')
 
 
+class PhaseTest(Sandbox):
+    """How far a run has got, as backup-sync writes it and the panels word it."""
+
+    def live_status(self, **fields):
+        proc = subprocess.Popen(['bash', '-c', 'exec -a backup-sync sleep 30'])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        time.sleep(0.2)
+        d = self.dest()
+        self.write_status(d, pid=proc.pid, boot_id=BOOT, **fields)
+        return read_status(str(d))
+
+    def test_listing_against_an_estimate(self):
+        st = self.live_status(state='scanning', progress=75.0, phase='listing', phase_done=3000,
+                              phase_total=2578214, phase_estimated=True)
+        self.assertEqual((st.phase, st.phase_done, st.phase_total, st.phase_estimated),
+                         ('listing', 3000, 2578214, True))
+        self.assertEqual(st.phase_label, 'Reading the source')
+        self.assertEqual(st.phase_count, '3,000 / ~2,578,214 files')
+        self.assertEqual(st.progress_text, '~75%')
+
+    def test_delete_pass_counts_folders(self):
+        st = self.live_status(state='scanning', progress=25.0, phase='deleting', phase_done=10,
+                              phase_total=40, phase_estimated=True, current_file='dir10')
+        self.assertEqual(st.phase_label, 'Finding deleted files')
+        self.assertEqual(st.phase_count, '10 / ~40 folders')
+
+    def test_comparison_names_the_file_and_the_copies(self):
+        st = self.live_status(state='running', progress=50.0, phase='checking', phase_done=2051,
+                              phase_total=4100, files_transferred=1, current_file='dir7/new file')
+        self.assertEqual(st.phase_label, '')   # the file is the headline
+        self.assertEqual(st.phase_count, '2,051 / 4,100 checked  \u00b7  1 copied')
+        self.assertEqual(st.progress_text, '50%')
+        st.current_file = ''
+        self.assertEqual(st.phase_label, 'Comparing with the mirror')
+
+    def test_unknown_total_counts_alone(self):
+        st = self.live_status(state='scanning', phase='listing', phase_done=1200)
+        self.assertEqual((st.phase_count, st.progress_text), ('1,200 files', ''))
+
+    def test_status_without_phases(self):
+        st = self.live_status(state='running', progress=40, files_transferred=3, files_total=9)
+        self.assertEqual((st.phase, st.phase_label, st.phase_count, st.progress_text),
+                         ('', '', '', '40%'))
+
+    def test_snapshot_carries_the_wording(self):
+        st = self.live_status(state='scanning', progress=75.0, phase='listing', phase_done=3000,
+                              phase_total=4000, phase_estimated=True)
+        d = st.to_dict()
+        self.assertEqual((d['phase_label'], d['phase_count'], d['progress_text'], d['phase_estimated']),
+                         ('Reading the source', '3,000 / ~4,000 files', '~75%', True))
+
+    def test_interrupted_run_forgets_its_phase(self):
+        d = self.dest()
+        self.write_status(d, state='scanning', pid=os.getpid(), boot_id='other-boot',
+                          phase='listing', phase_done=5, phase_total=9, phase_estimated=True)
+        st = read_status(str(d))
+        self.assertEqual((st.state, st.phase, st.phase_done, st.phase_count), ('deferred', '', 0, ''))
+
+
 class HistoryTest(Sandbox):
     def test_last_run_and_host(self):
         d = self.dest()

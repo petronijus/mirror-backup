@@ -92,8 +92,10 @@ def print_status(as_json: bool) -> int:
     for job in data['jobs']:
         st = job['status']
         line = f'{job["name"]:<16} {st["state"]:<12}'
-        if st['state'] in ('running', 'paused'):
-            line += f' {st["progress"]:.0f}%  {st["speed"]}  ETA {st["eta"]}'
+        if st['state'] in ('running', 'scanning', 'paused'):
+            parts = [st['phase_label'], st['progress_text'], st['speed'],
+                     f'ETA {st["eta"]}' if st['eta'] else '', st['phase_count']]
+            line += ' ' + '  '.join(p for p in parts if p)
         elif st['state'] in ('error', 'unavailable') and st['error']:
             line += f' {st["error"]}'
         last = job['last_run']

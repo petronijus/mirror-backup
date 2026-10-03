@@ -127,22 +127,27 @@ function route(job) {
   return shortMount(job.source) + " → " + shortMount(job.destination)
 }
 
+// phase_label, phase_count and progress_text are worded by mirror-backup
+// (models/job.py); a status written by a backup-sync without phases has none.
 function activityLine(job, nowMs) {
   var st = job.status || {}
   var state = jobState(job)
-  if (state === "scanning") {
-    var scan = ["Building file list…"]
-    // Nothing read yet (metadata from the cache, or over NFS) says nothing.
-    if (st.scan_read && !/^0 B$/.test(st.scan_read)) scan.push(st.scan_read + " read")
-    var el = elapsed(st.started, nowMs)
-    if (el) scan.push(el)
-    return scan.join("  ·  ")
-  }
   var parts = []
-  if (st.progress > 0) parts.push(Math.round(st.progress) + "%")
+  if (st.phase_label) parts.push(st.phase_label)
+  else if (state === "scanning") parts.push("Building file list…")
+  var pct = st.progress_text !== undefined ? st.progress_text
+    : st.progress > 0 ? Math.round(st.progress) + "%" : ""
+  if (pct) parts.push(pct)
   if (st.speed) parts.push(st.speed)
   if (st.eta && st.eta !== "0:00:00") parts.push("ETA " + st.eta)
-  if (st.files_total > 0) parts.push(st.files_transferred + " / " + st.files_total + " files")
+  if (st.phase_count) parts.push(st.phase_count)
+  else if (st.files_total > 0) parts.push(st.files_transferred + " / " + st.files_total + " files")
+  if (state === "scanning") {
+    // Nothing read yet (metadata from the cache, or over NFS) says nothing.
+    if (!st.phase && st.scan_read && !/^0 B$/.test(st.scan_read)) parts.push(st.scan_read + " read")
+    var el = elapsed(st.started, nowMs)
+    if (el) parts.push(el)
+  }
   return parts.join("  ·  ")
 }
 
@@ -180,8 +185,10 @@ function heroMeta(jobs) {
   var active = jobs.filter(function(j) { return isActive(jobState(j)) })
   if (active.length === 1) {
     var st = active[0].status || {}
+    var pct = st.progress_text !== undefined ? st.progress_text
+      : st.progress > 0 ? Math.round(st.progress) + "%" : ""
     return active[0].name + (jobState(active[0]) === "paused" ? " paused"
-      : st.progress > 0 ? " syncing " + Math.round(st.progress) + "%" : " scanning")
+      : (jobState(active[0]) === "scanning" ? " scanning" : " syncing") + (pct ? " " + pct : ""))
   }
   if (active.length > 1) return active.length + " backups running"
   var failed = jobs.filter(function(j) { return jobState(j) === "error" }).length

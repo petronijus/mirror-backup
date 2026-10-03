@@ -76,6 +76,20 @@ test('activity line', () => {
   assert.equal(M.activityLine(z, now), 'Building file list…  ·  0:04')
 })
 
+test('activity line through the phases', () => {
+  const l = job('scanning', { status: { state: 'scanning', phase: 'listing', phase_label: 'Reading the source',
+    progress_text: '~75%', phase_count: '3,000 / ~4,000 files', eta: '0:01:10', scan_read: '1.2 GB',
+    started: '2026-09-28T17:58:00+02:00' } })
+  assert.equal(M.activityLine(l, now), 'Reading the source  ·  ~75%  ·  ETA 0:01:10  ·  3,000 / ~4,000 files  ·  2:00')
+  const c = job('running', { status: { state: 'running', phase: 'checking', phase_label: '', progress: 50,
+    progress_text: '50%', speed: '1.23MB/s', phase_count: '2,051 / 4,100 checked  ·  1 copied',
+    files_transferred: 1, files_total: 4100 } })
+  assert.equal(M.activityLine(c, now), '50%  ·  1.23MB/s  ·  2,051 / 4,100 checked  ·  1 copied')
+  const p = job('running', { status: { state: 'running', phase: 'pruning', phase_label: 'Removing expired archives',
+    progress_text: '', phase_count: '' } })
+  assert.equal(M.activityLine(p, now), 'Removing expired archives')
+})
+
 test('schedule line names the host of the last run', () => {
   const j = job('idle', {
     next_run: '2026-09-30T11:00:00+02:00',
@@ -91,6 +105,9 @@ test('hero line', () => {
   assert.equal(M.heroMeta([]), 'No backup jobs')
   assert.equal(M.heroMeta([job('idle')]), 'All mirrors up to date')
   assert.equal(M.heroMeta([job('running', { status: { state: 'running', progress: 42 } })]), 'Music syncing 42%')
+  assert.equal(M.heroMeta([job('scanning', { status: { state: 'scanning', progress: 75, progress_text: '~75%' } })]),
+    'Music scanning ~75%')
+  assert.equal(M.heroMeta([job('scanning', { status: { state: 'scanning', progress: 0 } })]), 'Music scanning')
   assert.equal(M.heroMeta([job('error'), job('idle')]), '1 backup failed')
   assert.equal(M.heroMeta([job('unavailable'), job('unavailable')]), 'Destinations not mounted')
 })

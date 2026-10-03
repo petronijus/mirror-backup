@@ -7,7 +7,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GObject
 
-from backup_monitor.models.job import BackupJob
+from backup_monitor.models.job import PHASE_LABELS, BackupJob
 from backup_monitor.models.job_history import (
     read_history, compute_stats, HistoryEntry, HistoryStats,
 )
@@ -92,13 +92,18 @@ class JobDetailPage(Adw.NavigationPage):
             status_group.add(self._info_row('Last run', last))
 
         if st.state in ('running', 'scanning', 'paused'):
-            if st.progress > 0:
-                status_group.add(self._info_row('Progress', f'{st.progress:.0f}%'))
+            if st.phase in PHASE_LABELS:
+                status_group.add(self._info_row('Phase', PHASE_LABELS[st.phase]))
+            if st.progress_text:
+                status_group.add(self._info_row('Progress', st.progress_text))
             if st.speed:
                 status_group.add(self._info_row('Speed', st.speed))
             if st.eta and st.eta != '0:00:00':
                 status_group.add(self._info_row('ETA', st.eta))
-            if st.files_total > 0:
+            if st.phase_count:
+                status_group.add(self._info_row(
+                    'Folders' if st.phase == 'deleting' else 'Files', st.phase_count))
+            elif st.files_total > 0:   # written by a backup-sync without phases
                 status_group.add(self._info_row(
                     'Files', f'{st.files_transferred} / {st.files_total}'))
 

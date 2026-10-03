@@ -305,47 +305,43 @@ class BackupJobSection {
                 ? 'bm-progress-fill bm-progress-paused' : 'bm-progress-fill';
         }
 
-        // detail rows
+        // detail rows: what the run is at, how far it has got, and the count.
+        // phase_label, phase_count and progress_text are worded by
+        // mirror-backup (models/job.py); a status written by a backup-sync
+        // without phases has none of them.
         this._detailBox.visible = isActive;
         if (isActive && status) {
-            if (state === 'scanning') {
-                this._fileLabel.text = 'Building file list…';
-                this._fileLabel.visible = true;
+            let headline = status.phase_label || '';
+            if (!headline && status.current_file)
+                headline = this._shortenPath(status.current_file);
+            if (!headline && state === 'scanning')
+                headline = 'Building file list…';
+            this._fileLabel.text = headline;
+            this._fileLabel.visible = headline !== '';
 
-                const sp = [];
-                if (status.scan_read && status.scan_read !== '0 B')
-                    sp.push(`${status.scan_read} read`);
+            const parts = [];
+            const pct = status.progress_text ??
+                (status.progress > 0 ? `${Math.round(status.progress)}%` : '');
+            if (pct) parts.push(pct);
+            if (status.speed) parts.push(status.speed);
+            if (status.eta && status.eta !== '0:00:00')
+                parts.push(`ETA ${status.eta}`);
+            if (state === 'scanning') {
+                if (!status.phase && status.scan_read && status.scan_read !== '0 B')
+                    parts.push(`${status.scan_read} read`);
                 if (status.started) {
                     const elapsed = this._formatElapsed(status.started);
-                    if (elapsed) sp.push(elapsed);
-                }
-                this._statsLabel.text = sp.join('  ·  ');
-                this._statsLabel.visible = sp.length > 0;
-                this._filesLabel.visible = false;
-            } else {
-                if (status.current_file) {
-                    this._fileLabel.text = this._shortenPath(status.current_file);
-                    this._fileLabel.visible = true;
-                } else {
-                    this._fileLabel.visible = false;
-                }
-
-                const parts = [];
-                if (status.progress > 0) parts.push(`${Math.round(status.progress)}%`);
-                if (status.speed) parts.push(status.speed);
-                if (status.eta && status.eta !== '0:00:00')
-                    parts.push(`ETA ${status.eta}`);
-                this._statsLabel.text = parts.join('  ·  ');
-                this._statsLabel.visible = parts.length > 0;
-
-                if (status.files_total > 0) {
-                    this._filesLabel.text =
-                        `${status.files_transferred} / ${status.files_total} files`;
-                    this._filesLabel.visible = true;
-                } else {
-                    this._filesLabel.visible = false;
+                    if (elapsed) parts.push(elapsed);
                 }
             }
+            this._statsLabel.text = parts.join('  ·  ');
+            this._statsLabel.visible = parts.length > 0;
+
+            let count = status.phase_count || '';
+            if (!count && status.files_total > 0)
+                count = `${status.files_transferred} / ${status.files_total} files`;
+            this._filesLabel.text = count;
+            this._filesLabel.visible = count !== '';
         }
 
         // error, or why the destination cannot be used

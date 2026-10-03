@@ -10,6 +10,15 @@ from backup_monitor import paths
 
 ACTIVE_STATES = ('running', 'scanning', 'paused', 'queued')
 
+# What backup-sync is doing (its "progress" section), as the panels name it.
+PHASE_LABELS = {
+    'listing': 'Reading the source',
+    'deleting': 'Finding deleted files',
+    'checking': 'Comparing with the mirror',
+    'pruning': 'Removing expired archives',
+}
+_PHASE_UNITS = {'listing': 'files', 'deleting': 'folders', 'checking': 'checked'}
+
 
 @dataclass
 class BackupStatus:
@@ -27,6 +36,12 @@ class BackupStatus:
     updated: str = ''
     error: str = ''
     scan_read: str = ''
+    # Empty from a backup-sync older than the phases; then only scan_read and
+    # rsync's own figures are known.
+    phase: str = ''
+    phase_done: int = 0
+    phase_total: int = 0           # 0 = not known
+    phase_estimated: bool = False  # phase_total is the previous run's count
     consecutive_failures: int = 0
     suggested_excludes: list[str] = field(default_factory=list)
     # 'suspend' or 'shutdown' while postponed; 'interrupted' for a run that
@@ -48,6 +63,35 @@ class BackupStatus:
     def active(self) -> bool:
         return self.state in ('running', 'scanning', 'paused')
 
+    @property
+    def phase_label(self) -> str:
+        """The phase as a headline — empty while rsync compares files and
+        names the one it is at, which says more."""
+        if self.phase == 'checking' and self.current_file:
+            return ''
+        return PHASE_LABELS.get(self.phase, '')
+
+    @property
+    def progress_text(self) -> str:
+        """'48%', '~48%' against an estimated total, '' before there is any."""
+        if self.progress <= 0:
+            return ''
+        return f'{"~" if self.phase_estimated else ""}{self.progress:.0f}%'
+
+    @property
+    def phase_count(self) -> str:
+        """How far the phase has got: '1,027 / ~2,578,214 files'."""
+        unit = _PHASE_UNITS.get(self.phase)
+        if unit is None:
+            return ''
+        if self.phase_total:
+            text = f'{self.phase_done:,} / {"~" if self.phase_estimated else ""}{self.phase_total:,} {unit}'
+        else:
+            text = f'{self.phase_done:,} {unit}'
+        if self.phase == 'checking' and self.files_transferred:
+            text += f'  \u00b7  {self.files_transferred:,} copied'
+        return text
+
     def to_dict(self) -> dict:
         return {
             'state': self.state,
@@ -61,6 +105,14 @@ class BackupStatus:
             'updated': self.updated,
             'error': self.error,
             'scan_read': self.scan_read,
+            'phase': self.phase,
+            'phase_done': self.phase_done,
+            'phase_total': self.phase_total,
+            'phase_estimated': self.phase_estimated,
+            # Worded once here, so every panel says the same.
+            'phase_label': self.phase_label,
+            'phase_count': self.phase_count,
+            'progress_text': self.progress_text,
             'consecutive_failures': self.consecutive_failures,
             'suggested_excludes': list(self.suggested_excludes),
             'deferred_reason': self.deferred_reason,
@@ -107,6 +159,10 @@ def read_status(destination: str, *, current_boot: str | None = None) -> BackupS
         updated=str(data.get('updated', '')),
         error=str(data.get('error', '')),
         scan_read=str(data.get('scan_read', '')),
+        phase=str(data.get('phase', '')),
+        phase_done=int(_number(data.get('phase_done'))),
+        phase_total=int(_number(data.get('phase_total'))),
+        phase_estimated=data.get('phase_estimated') is True,
         consecutive_failures=int(_number(data.get('consecutive_failures'))),
         suggested_excludes=[str(s) for s in data.get('suggested_excludes', []) or []],
         deferred_reason=str(data.get('deferred_reason', '')),
@@ -138,6 +194,10 @@ def _clear_progress(st: BackupStatus):
     st.eta = ''
     st.current_file = ''
     st.scan_read = ''
+    st.phase = ''
+    st.phase_done = 0
+    st.phase_total = 0
+    st.phase_estimated = False
 
 
 def _number(value) -> float:
