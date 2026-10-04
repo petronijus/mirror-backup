@@ -25,7 +25,7 @@ architecture, especially "Several machines, one set of jobs".
 `src/backup_monitor/adw_omarchy.py` is the **canonical** copy of the Omarchy
 look; gdrive-for-linux carries a vendored copy (`app/adw_omarchy.py`). After
 changing it here, re-vendor: `scripts/vendor-adw-omarchy.sh
-~/Documents/Dev/gdrive-for-linux/app/adw_omarchy.py` (its tests fail on a
+~/Documents/Dev/linux-apps/gdrive-for-linux/app/adw_omarchy.py` (its tests fail on a
 stale or hand-edited copy). tests/test_adw_omarchy.py parses the CSS for every
 theme Omarchy ships. `desktop_theme.py`
 holds only Mirror Backup's own rules (`extra_css`). GNOME is untouched.
