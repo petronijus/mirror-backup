@@ -17,6 +17,8 @@ export XDG_RUNTIME_DIR="$TMP/run"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$TMP/no-bus"
 export BACKUP_SYNC_LOGIND_BUS=session
 export BACKUP_SYNC_FSTAB="$TMP/fstab"
+export BACKUP_SYNC_UNIT_DIRS="$TMP/units"   # mount units the tests declare; none of the real ones
+mkdir -p "$BACKUP_SYNC_UNIT_DIRS"
 unset TRIGGER_UNIT BACKUP_SYNC_SCHEDULE
 mkdir -p "$XDG_RUNTIME_DIR"
 : > "$BACKUP_SYNC_FSTAB"
@@ -93,6 +95,15 @@ check "exits 1" '[[ $rc == 1 ]]'
 check "nothing written into the mount point" '[[ -z $(ls -A "$CASE/dst") ]]'
 check "says why" 'grep -q "Destination not mounted: $CASE/dst" "$CASE/out"'
 : > "$BACKUP_SYNC_FSTAB"
+
+# ── destination on a mount point a mount unit declares ──
+new_case unit-mounted-destination
+: > "$BACKUP_SYNC_UNIT_DIRS/$(systemd-escape --path "$CASE/dst").mount"
+rc=$(run_sync)
+check "exits 1" '[[ $rc == 1 ]]'
+check "nothing written into the mount point" '[[ -z $(ls -A "$CASE/dst") ]]'
+check "says why" 'grep -q "Destination not mounted: $CASE/dst" "$CASE/out"'
+rm -f "$BACKUP_SYNC_UNIT_DIRS"/*.mount
 
 # ── source on an unmounted mount point ──
 new_case unmounted-source
@@ -226,6 +237,168 @@ wait "$SYNC_PID"; rc=$?
 check "exits 0" '[[ $rc == 0 ]]'
 check "finished: idle, 100 %, no phase" '[[ $(json "$STATE/status.json" "d[\"state\"], d[\"progress\"], d[\"phase\"]") == "('"'"'idle'"'"', 100, '"''"')" ]]'
 check "history carries this run's totals" '[[ $(last_history "d[\"files_total\"], d[\"dirs_total\"]") == "(4100, 1)" ]]'
+
+# ── the system queue: one lock for user and system jobs ──
+# The system part's tmpfiles.d entry makes it root's and read-only; a user job
+# takes it all the same (flock needs an open file, not a writable one).
+new_case shared-queue
+SYSRUN="$TMP/sysrun"
+mkdir -p "$SYSRUN" && : > "$SYSRUN/queue.lock" && chmod 444 "$SYSRUN/queue.lock"
+STATE="$CASE/dst/.mirror-backup"
+flock "$SYSRUN/queue.lock" sleep 2 &
+HOLDER=$!
+sleep 0.3
+BACKUP_SYNC_SYSTEM_RUN_DIR="$SYSRUN" "$SYNC" test-job "$SRC" "$DST" "" 0 >"$CASE/out" 2>&1 &
+SYNC_PID=$!
+check "waits in the shared queue" 'wait_for "d[\"state\"] == \"queued\""'
+wait "$HOLDER"; wait "$SYNC_PID"; rc=$?
+check "then runs" '[[ $rc == 0 && -f "$CASE/dst/a.txt" ]]'
+
+new_case system-scope
+STATE="$CASE/dst/.mirror-backup"
+rc=$(BACKUP_SYNC_SCOPE=system BACKUP_SYNC_SYSTEM_RUN_DIR="$SYSRUN" run_sync)
+check "exits 0" '[[ $rc == 0 && -f "$CASE/dst/a.txt" ]]'
+check "runtime files in the system run dir, none in the user's" \
+    '[[ -z $(ls -A "$SYSRUN" | grep -v "^queue.lock$") && ! -e "$XDG_RUNTIME_DIR/backup-sync/test-job.pid" ]]'
+rc=$(BACKUP_SYNC_SCOPE=galaxy run_sync)
+check "an unknown scope is refused" '[[ $rc == 2 ]]'
+
+# ── restic ──
+if ! command -v restic >/dev/null; then
+    printf '\n== restic\n  (restic not installed — skipped)\n'
+else
+export RESTIC_PASSWORD_FILE="$TMP/restic.key" RESTIC_CACHE_DIR="$TMP/restic-cache"
+echo "test password" > "$RESTIC_PASSWORD_FILE"
+# run_restic [mode]: SRC and DST as a restic job sees them — the path list,
+# or the source job's destination when copying.
+run_restic() {
+    BACKUP_SYNC_ENGINE=restic BACKUP_SYNC_RESTIC_MODE="${1:-backup}" BACKUP_SYNC_RESTIC_HOST=test-host \
+        "$SYNC" test-job "$RSRC" "$RDST" "${REXCLUDE:-}" 0 >"$CASE/out" 2>&1
+    echo $?
+}
+snapshots() { restic -r "$1" snapshots --json --no-lock 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$2"; }
+
+new_case restic-backup
+mkdir -p "$CASE/second" && echo three > "$CASE/second/c.txt" && echo skip > "$CASE/src/skip.me"
+printf '# paths\n%s\n\n  %s  \n' "$CASE/src" "$CASE/second" > "$CASE/paths"
+printf '*.me\n' > "$CASE/exclude"
+restic init -r "$CASE/dst/repo" >/dev/null 2>&1
+RSRC="$CASE/paths" RDST="$CASE/dst" REXCLUDE="$CASE/exclude"
+STATE="$CASE/dst/.mirror-backup"
+rc=$(BACKUP_SYNC_RESTIC_KEEP="--keep-last 2" run_restic)
+check "exits 0" '[[ $rc == 0 ]]'
+check "one snapshot, of both listed paths, under the job's host" \
+    '[[ $(snapshots "$CASE/dst/repo" "len(d), d[0][\"hostname\"], len(d[0][\"paths\"])") == "(1, '"'"'test-host'"'"', 2)" ]]'
+check "the exclude file applies" '! restic -r "$CASE/dst/repo" ls latest --no-lock 2>/dev/null | grep -q skip.me'
+check "the state stays out of the repository" '[[ -f $STATE/status.json && -d "$CASE/dst/repo/data" ]]'
+check "status: idle, 100 %, engine restic" \
+    '[[ $(json "$STATE/status.json" "d[\"state\"], d[\"progress\"], d[\"engine\"]") == "('"'"'idle'"'"', 100, '"'"'restic'"'"')" ]]'
+check "status names the paths" '[[ $(json "$STATE/status.json" "d[\"src\"]") == "$CASE/src, $CASE/second" ]]'
+SNAP=$(snapshots "$CASE/dst/repo" 'd[0]["id"]')
+check "history: the snapshot and what it added" \
+    '[[ $(last_history "d[\"engine\"], d[\"snapshot_id\"], d[\"files_new\"], d[\"exit_code\"]") == "('"'"'restic'"'"', '"'"'$SNAP'"'"', 3, 0)" ]]'
+check "first run prunes and checks" \
+    '[[ -n $(json "$STATE/maintenance.json" "d[\"prune\"]") && -n $(json "$STATE/maintenance.json" "d[\"check\"]") ]]'
+check "every step in the log" \
+    'for p in prepare snapshot forget prune verify; do grep -q "=== .* === $p: exit 0 ===" "$STATE/backup.log" || exit 1; done'
+PRUNED=$(json "$STATE/maintenance.json" 'd["prune"]')
+echo four > "$CASE/src/d.txt"; rc=$(BACKUP_SYNC_RESTIC_KEEP="--keep-last 2" run_restic)
+echo five > "$CASE/src/e.txt"; rc=$(BACKUP_SYNC_RESTIC_KEEP="--keep-last 2" run_restic)
+check "retention keeps the last two" '[[ $rc == 0 && $(snapshots "$CASE/dst/repo" "len(d)") == 2 ]]'
+check "prune is not due again the same day" '[[ $(json "$STATE/maintenance.json" "d[\"prune\"]") == "$PRUNED" ]] && ! grep -q "prune: exit" <(tail -n 8 "$STATE/backup.log")'
+
+# ── a copy job: the snapshots into a second repository ──
+COPY_SRC="$CASE/dst"
+new_case restic-copy
+restic init -r "$CASE/dst/repo" --from-repo "$COPY_SRC/repo" --from-password-file "$RESTIC_PASSWORD_FILE" \
+    --copy-chunker-params >/dev/null 2>&1
+RSRC="$COPY_SRC" RDST="$CASE/dst" REXCLUDE=""
+STATE="$CASE/dst/.mirror-backup"
+rc=$(BACKUP_SYNC_RESTIC_KEEP="--keep-last 1" run_restic copy)
+check "exits 0" '[[ $rc == 0 ]]'
+check "copied the host's snapshots, then thinned them" '[[ $(snapshots "$CASE/dst/repo" "len(d), d[0][\"hostname\"]") == "(1, '"'"'test-host'"'"')" ]]'
+check "history counts the copies" '[[ $(last_history "d[\"engine\"], d[\"snapshots_copied\"]") == "('"'"'restic'"'"', 2)" ]]'
+check "the source repository is untouched" '[[ $(snapshots "$COPY_SRC/repo" "len(d)") == 2 ]]'
+
+# ── no repository: never initialised by a run ──
+new_case restic-no-repo
+printf '%s\n' "$CASE/src" > "$CASE/paths"
+RSRC="$CASE/paths" RDST="$CASE/dst"
+rc=$(run_restic)
+check "exits 1" '[[ $rc == 1 ]]'
+check "says why" 'grep -q "No restic repository in $CASE/dst/repo" "$CASE/out"'
+check "no repository created" '[[ ! -e "$CASE/dst/repo" ]]'
+
+# ── a listed path on an unmounted mount point ──
+new_case restic-unmounted-path
+mkdir -p "$CASE/bind"
+printf '%s\n%s\n' "$CASE/src" "$CASE/bind" > "$CASE/paths"
+restic init -r "$CASE/dst/repo" >/dev/null 2>&1
+echo "$CASE/elsewhere $CASE/bind none bind 0 0" > "$BACKUP_SYNC_FSTAB"
+RSRC="$CASE/paths" RDST="$CASE/dst"
+rc=$(run_restic)
+check "refuses (exit 1)" '[[ $rc == 1 ]]'
+check "says which" 'grep -q "Source not mounted: $CASE/bind" "$CASE/out"'
+check "no snapshot taken" '[[ $(snapshots "$CASE/dst/repo" "len(d)") == 0 ]]'
+: > "$BACKUP_SYNC_FSTAB"
+
+# ── unreadable files: a snapshot without them, a warning, a suggestion ──
+if (( EUID != 0 )); then
+    new_case restic-unreadable
+    echo secret > "$CASE/src/locked" && chmod 000 "$CASE/src/locked"
+    printf '%s\n' "$CASE/src" > "$CASE/paths"
+    restic init -r "$CASE/dst/repo" >/dev/null 2>&1
+    RSRC="$CASE/paths" RDST="$CASE/dst"
+    STATE="$CASE/dst/.mirror-backup"
+    rc=$(run_restic)
+    check "exits 0 (restic's 3 is a warning)" '[[ $rc == 0 && $(last_history "d[\"exit_code\"]") == 0 ]]'
+    check "says so" '[[ $(json "$STATE/status.json" "d[\"error\"]") == *"could not be read"* ]]'
+    check "suggests excluding it" '[[ $(json "$STATE/status.json" "d[\"suggested_excludes\"]") == "['"'"'$CASE/src/locked'"'"']" ]]'
+    chmod 600 "$CASE/src/locked"
+fi
+
+# ── the pre-command ──
+new_case restic-pre-command
+printf '%s\n' "$CASE/src" > "$CASE/paths"
+restic init -r "$CASE/dst/repo" >/dev/null 2>&1
+RSRC="$CASE/paths" RDST="$CASE/dst"
+STATE="$CASE/dst/.mirror-backup"
+printf '#!/bin/sh\necho "metadata written"\n' > "$CASE/pre-ok" && chmod +x "$CASE/pre-ok"
+printf '#!/bin/sh\necho "no disk" >&2\nexit 4\n' > "$CASE/pre-fail" && chmod +x "$CASE/pre-fail"
+rc=$(BACKUP_SYNC_PRE_COMMAND="$CASE/pre-ok" run_restic)
+check "runs first, output in the log" '[[ $rc == 0 ]] && grep -q "metadata written" "$STATE/backup.log"'
+rc=$(BACKUP_SYNC_PRE_COMMAND="$CASE/pre-fail" run_restic)
+check "a failing one ends the run" '[[ $rc == 4 && $(snapshots "$CASE/dst/repo" "len(d)") == 1 ]]'
+check "and says so" '[[ $(json "$STATE/status.json" "d[\"state\"], d[\"error\"]") == "('"'"'error'"'"', '"'"'Preparation failed: no disk'"'"')" ]]'
+
+# ── progress of a restic run ──
+# A stand-in restic: `backup` prints a status message like the real one and
+# waits for the test, the other commands do nothing.
+new_case restic-phases
+printf '%s\n' "$CASE/src" > "$CASE/paths"
+mkdir -p "$CASE/dst/repo" "$CASE/gate" "$TMP/rbin" && : > "$CASE/dst/repo/config"
+cat > "$TMP/rbin/restic" <<'EOF'
+#!/usr/bin/env bash
+step() { for _ in $(seq 600); do [[ -e "$GATE/$1" ]] && return; sleep 0.05; done; exit 99; }
+[[ $1 == backup ]] || exit 0
+printf '{"message_type":"status","percent_done":0.5,"total_files":40,"files_done":10,"total_bytes":2000,"bytes_done":1000,"seconds_remaining":75,"current_files":["/data/a \\"b\\".txt","/data/c"]}\n'
+step seen
+printf '{"message_type":"summary","files_new":3,"files_changed":1,"files_unmodified":36,"data_added":512,"total_files_processed":40,"total_bytes_processed":2000,"snapshot_id":"abc123"}\n'
+EOF
+chmod +x "$TMP/rbin/restic"
+STATE="$CASE/dst/.mirror-backup"
+PATH="$TMP/rbin:$PATH" GATE="$CASE/gate" BACKUP_SYNC_ENGINE=restic BACKUP_SYNC_RESTIC_CHECK_DAYS=0 BACKUP_SYNC_RESTIC_PRUNE_DAYS=0 \
+    "$SYNC" test-job "$CASE/paths" "$CASE/dst" "" 0 >"$CASE/out" 2>&1 &
+SYNC_PID=$!
+snapshot='(d["state"], d["phase"], d["phase_unit"], d["phase_done"], d["phase_total"], d["progress"], d["eta"], d["files_transferred"], d["files_total"], d["current_file"]) == ("running", "snapshot", "bytes", 1000, 2000, 50.0, "0:01:15", 10, 40, "/data/a \"b\".txt")'
+check "snapshot: bytes of the total, files, restic's ETA, the current file" 'wait_for "$snapshot"'
+touch "$CASE/gate/seen"
+wait "$SYNC_PID"; rc=$?
+check "exits 0" '[[ $rc == 0 ]]'
+check "history from the summary" \
+    '[[ $(last_history "d[\"snapshot_id\"], d[\"files_transferred\"], d[\"files_total\"], d[\"data_added\"], d[\"bytes_total\"]") == "('"'"'abc123'"'"', 4, 40, 512, 2000)" ]]'
+check "maintenance switched off: no prune, no check" '[[ ! -e "$STATE/maintenance.json" ]]'
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

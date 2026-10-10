@@ -59,6 +59,31 @@ function _runSystemctlAsync(args, callback) {
     }
 }
 
+// Start, stop, pause or resume a job. `mirror-backup control` knows whether it
+// is the user's or a system job (run by root, controlled through polkit), so
+// the panel does not have to.
+function _runControlAsync(jobId, action, callback) {
+    try {
+        const proc = Gio.Subprocess.new(
+            [MIRROR_BACKUP, 'control', jobId, action],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        );
+        proc.communicate_utf8_async(null, null, (_proc, res) => {
+            try {
+                const [, , stderr] = _proc.communicate_utf8_finish(res);
+                if (!_proc.get_successful())
+                    log(`[BackupMonitor] ${action} ${jobId}: ${stderr?.trim() ?? ''}`);
+                if (callback) callback();
+            } catch (e) {
+                if (callback) callback(e);
+            }
+        });
+    } catch (e) {
+        log(`[BackupMonitor] mirror-backup control error: ${e.message}`);
+        if (callback) callback(e);
+    }
+}
+
 // Every job's state, as `mirror-backup status --json` reports it. The rules
 // for where a job's state lives (its destination) and when a run counts as
 // alive are the app's; the panel only displays the result. Calls back with
@@ -403,22 +428,22 @@ class BackupJobSection {
     // ── actions ──
 
     _onStart() {
-        _runSystemctlAsync(['start', this._job.service], () => this.onChanged?.());
+        _runControlAsync(this._job.id, 'start', () => this.onChanged?.());
         this._paused = false;
     }
 
     _onStop() {
-        // backup-sync resumes a paused rsync itself before stopping it.
-        _runSystemctlAsync(['stop', this._job.service], () => this.onChanged?.());
+        // backup-sync resumes a paused run itself before stopping it.
+        _runControlAsync(this._job.id, 'stop', () => this.onChanged?.());
         this._paused = false;
     }
 
     _onPause() {
         if (this._paused || this.state === 'paused') {
-            _runSystemctlAsync(['kill', '--signal=USR2', this._job.service], () => this.onChanged?.());
+            _runControlAsync(this._job.id, 'resume', () => this.onChanged?.());
             this._paused = false;
         } else {
-            _runSystemctlAsync(['kill', '--signal=USR1', this._job.service], () => this.onChanged?.());
+            _runControlAsync(this._job.id, 'pause', () => this.onChanged?.());
             this._paused = true;
         }
     }

@@ -374,7 +374,7 @@ class ResumeTest(Sandbox):
                 self.job('backup-gone', self.root / 'gone')]
         started = []
 
-        def fake(*args):
+        def fake(*args, scope='user'):
             if args[0] == 'start':
                 started.append(args[-1])
             return subprocess.CompletedProcess(args, 0, 'loaded' if args[0] == 'show' else '', '')

@@ -5,16 +5,22 @@ from __future__ import annotations
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GObject
+from gi.repository import Gtk, Adw, Gio, GLib, GObject
 
+import sys
 from pathlib import Path
 
-from backup_monitor import paths
+from backup_monitor import paths, units
 from backup_monitor.services.job_manager import JobManager, create_exclude_file
 
 FREQ_MODES = ['Weekly', 'Monthly', 'Custom', 'Manual only']
 WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 WEEKDAY_SYSTEMD = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+ENGINES = ['rsync', 'restic']
+SCOPES = ['user', 'system']
+RESTIC_MODES = ['backup', 'copy']
+KEEP_KEYS = ['daily', 'weekly', 'monthly', 'yearly']
+META_COMMAND = 'mirror-backup-system-meta'
 
 
 class JobEditorPage(Adw.NavigationPage):
@@ -35,6 +41,8 @@ class JobEditorPage(Adw.NavigationPage):
         self._job_id = job_id
         self._job_data = job_manager.get_job(job_id) if job_id else None
         self._exclude_file = self._job_data.get('exclude_file', '') if self._job_data else ''
+        self._engine = units.job_engine(self._job_data) if self._job_data else 'rsync'
+        self._scope = units.job_scope(self._job_data) if self._job_data else 'user'
 
         # Main layout
         toolbar = Adw.ToolbarView()
@@ -88,9 +96,67 @@ class JobEditorPage(Adw.NavigationPage):
         self._desc_row = Adw.EntryRow(title='Description')
         basic_group.add(self._desc_row)
 
+        # Kind and scope: fixed once a job exists (a job changes neither its
+        # repository format nor the file it is kept in).
+        kind_group = Adw.PreferencesGroup(
+            title='Kind',
+            description='A mirror keeps the latest state as plain files; snapshots keep every '
+                        'version, deduplicated and encrypted. System jobs run as root and read '
+                        'every file — what a backup of the whole system needs; installing one '
+                        'asks for your password.' if is_new else '',
+        )
+        form.append(kind_group)
+        self._engine_row = Adw.ComboRow(
+            title='Backup',
+            model=Gtk.StringList.new(['Mirror (rsync)', 'Snapshots (restic)']),
+            sensitive=is_new,
+        )
+        self._engine_row.set_selected(ENGINES.index(self._engine))
+        self._engine_row.connect('notify::selected', self._on_kind_changed)
+        kind_group.add(self._engine_row)
+        self._scope_row = Adw.ComboRow(
+            title='Runs as',
+            model=Gtk.StringList.new(['You', 'System (root)']),
+            sensitive=is_new,
+        )
+        self._scope_row.set_selected(SCOPES.index(self._scope))
+        self._scope_row.connect('notify::selected', self._on_kind_changed)
+        kind_group.add(self._scope_row)
+
         # ── Paths ──
         paths_group = Adw.PreferencesGroup(title='Paths')
         form.append(paths_group)
+
+        self._restic_mode_row = Adw.ComboRow(
+            title='Snapshots of',
+            model=Gtk.StringList.new(['Paths listed below', 'Another job (copy its snapshots)']),
+        )
+        self._restic_mode_row.connect('notify::selected', self._on_kind_changed)
+        paths_group.add(self._restic_mode_row)
+
+        self._from_ids = [j['id'] for j in job_manager.jobs + job_manager.system_jobs
+                          if units.job_engine(j) == 'restic' and j['id'] != job_id]
+        self._from_job_row = Adw.ComboRow(
+            title='Copy from',
+            model=Gtk.StringList.new(self._from_ids or ['(no restic job yet)']),
+            sensitive=bool(self._from_ids),
+        )
+        paths_group.add(self._from_job_row)
+
+        # The paths a restic job backs up, one per line. A group of its own:
+        # a group lists widgets that are not rows after all of its rows.
+        self._paths_group = Adw.PreferencesGroup(
+            title='Paths to back up',
+            description='One absolute path per line. Each counts on its own file system: a path '
+                        'on another disk, or a bind mount, has to be listed itself.',
+        )
+        self._paths_view = Gtk.TextView(
+            monospace=True, wrap_mode=Gtk.WrapMode.NONE,
+            top_margin=8, bottom_margin=8, left_margin=12, right_margin=12,
+        )
+        self._paths_group.add(Gtk.Frame(child=Gtk.ScrolledWindow(
+            child=self._paths_view, min_content_height=200,
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)))
 
         # Source path with folder picker
         self._source_row = Adw.EntryRow(title='Source')
@@ -113,6 +179,8 @@ class JobEditorPage(Adw.NavigationPage):
         dest_btn.connect('clicked', lambda b: self._pick_folder(self._dest_row))
         self._dest_row.add_suffix(dest_btn)
         paths_group.add(self._dest_row)
+
+        form.append(self._paths_group)
 
         # ── Schedule ──
         schedule_group = Adw.PreferencesGroup(title='Schedule')
@@ -254,12 +322,54 @@ class JobEditorPage(Adw.NavigationPage):
         enabled_row.set_activatable_widget(self._enabled_switch)
         advanced_group.add(enabled_row)
 
+        # ── restic ──
+        restic_group = Adw.PreferencesGroup(
+            title='Snapshots',
+            description=GLib.markup_escape_text(
+                'The repository is <destination>/repo; create it once with '
+                f'sudo {paths.SYSTEM_COMMAND} system init <job> (system jobs) '
+                'or restic init (your own).'),
+        )
+        self._restic_group = restic_group
+        form.append(restic_group)
+        self._password_row = Adw.EntryRow(title='Repository password file')
+        restic_group.add(self._password_row)
+        self._host_row = Adw.EntryRow(title=f'Snapshot host name (empty: {paths.host_name()})')
+        restic_group.add(self._host_row)
+        self._keep_rows = {}
+        for key, default in zip(KEEP_KEYS, (7, 4, 6, 0)):
+            row = Adw.SpinRow.new_with_range(0, 1000, 1)
+            row.set_title(f'Keep {key} snapshots')
+            row.set_value(default)
+            self._keep_rows[key] = row
+            restic_group.add(row)
+        self._prune_row = Adw.SpinRow.new_with_range(0, 365, 1)
+        self._prune_row.set_title('Prune every (days)')
+        self._prune_row.set_subtitle('Frees what forgotten snapshots held; 0 = never')
+        self._prune_row.set_value(7)
+        restic_group.add(self._prune_row)
+        self._check_row = Adw.SpinRow.new_with_range(0, 365, 1)
+        self._check_row.set_title('Check the repository every (days)')
+        self._check_row.set_subtitle('Reads back a part of the data each time; 0 = never')
+        self._check_row.set_value(7)
+        restic_group.add(self._check_row)
+        self._subset_row = Adw.EntryRow(title='Data read per check (e.g. 5%, 1/10, 2G)')
+        self._subset_row.set_text('5%')
+        restic_group.add(self._subset_row)
+        self._meta_row = Adw.SwitchRow(
+            title='Write restore metadata first',
+            subtitle='Partition tables, LUKS headers, package lists — what a bare-metal '
+                     'restore needs (system jobs)',
+        )
+        restic_group.add(self._meta_row)
+
         # ── Rsync Options ──
         rsync_group = Adw.PreferencesGroup(
             title='Rsync Options',
             description='Fine-tune rsync behavior for this job',
         )
         form.append(rsync_group)
+        self._rsync_group = rsync_group
 
         # Delete mode
         delete_strings = Gtk.StringList()
@@ -313,6 +423,7 @@ class JobEditorPage(Adw.NavigationPage):
         # ── Populate form if editing ──
         if self._job_data:
             self._populate(self._job_data)
+        self._on_kind_changed()
 
     def _populate(self, job: dict):
         """Fill the form with existing job data."""
@@ -343,6 +454,23 @@ class JobEditorPage(Adw.NavigationPage):
         else:
             self._exclude_row.set_subtitle('No exclude file')
 
+        # restic
+        restic = job.get('restic') or {}
+        self._restic_mode_row.set_selected(RESTIC_MODES.index(restic.get('mode', 'backup'))
+                                           if restic.get('mode', 'backup') in RESTIC_MODES else 0)
+        self._paths_view.get_buffer().set_text('\n'.join(restic.get('paths', [])))
+        if restic.get('from_job') in self._from_ids:
+            self._from_job_row.set_selected(self._from_ids.index(restic['from_job']))
+        self._password_row.set_text(restic.get('password_file', ''))
+        self._host_row.set_text(restic.get('host', ''))
+        keep = restic.get('keep', {})
+        for key, row in self._keep_rows.items():
+            row.set_value(int(keep.get(key, 0) or 0) if keep else row.get_value())
+        self._prune_row.set_value(int(restic.get('prune_every_days', 7)))
+        self._check_row.set_value(int(restic.get('check_every_days', 7)))
+        self._subset_row.set_text(restic.get('check_subset', '5%'))
+        self._meta_row.set_active(job.get('pre_command') == META_COMMAND)
+
         # Rsync options
         rsync_opts = job.get('rsync_options', {})
         delete_mode = rsync_opts.get('delete_mode', 'before')
@@ -354,6 +482,25 @@ class JobEditorPage(Adw.NavigationPage):
 
         self._max_size_row.set_text(rsync_opts.get('max_size', ''))
         self._min_size_row.set_text(rsync_opts.get('min_size', ''))
+
+    def _on_kind_changed(self, *args):
+        """Show what the kind of job asks for: a source and rsync options for a
+        mirror; paths or a job to copy, and retention, for snapshots."""
+        self._engine = ENGINES[self._engine_row.get_selected()]
+        self._scope = SCOPES[self._scope_row.get_selected()]
+        restic = self._engine == 'restic'
+        copy = restic and RESTIC_MODES[self._restic_mode_row.get_selected()] == 'copy'
+        self._source_row.set_visible(not restic)
+        self._restic_mode_row.set_visible(restic)
+        self._paths_group.set_visible(restic and not copy)
+        self._from_job_row.set_visible(copy)
+        self._restic_group.set_visible(restic)
+        self._rsync_group.set_visible(not restic)
+        self._archive_row.set_visible(not restic)
+        self._bwlimit_row.set_visible(not restic)
+        self._meta_row.set_visible(restic and not copy and self._scope == 'system')
+        if restic and not self._password_row.get_text() and self._scope == 'system':
+            self._password_row.set_text(str(paths.system_config_dir() / 'keys' / 'NAME.key'))
 
     def _on_freq_changed(self, combo, pspec):
         idx = combo.get_selected()
@@ -571,25 +718,32 @@ class JobEditorPage(Adw.NavigationPage):
 
         # Determine exclude file path
         exclude_file = self._exclude_file
+        directory = paths.system_source_dir() if self._scope == 'system' else None
         if not exclude_file and self._job_id:
-            exclude_file = create_exclude_file(self._job_id)
+            exclude_file = create_exclude_file(self._job_id, directory, engine=self._engine)
         elif not exclude_file:
             # New job, create temp path based on name
             name = self._name_row.get_text().strip() or 'new'
             import re
             safe_name = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
-            exclude_file = create_exclude_file(f'backup-{safe_name}')
+            exclude_file = create_exclude_file(f'backup-{safe_name}', directory, engine=self._engine)
         # Remembered for the save: a new job has no stored exclude file yet.
         self._exclude_file = exclude_file
         self._exclude_row.set_subtitle(Path(exclude_file).name)
 
-        editor = ExclusionEditorPage(exclude_file)
+        editor = ExclusionEditorPage(self._exclude_path(exclude_file))
         nav = self.get_root()
         if hasattr(nav, 'push_page'):
             nav.push_page(editor)
         else:
             # Try to find navigation view
             self._find_nav_view().push(editor)
+
+    def _exclude_path(self, name: str) -> str:
+        """A system job's exclude file sits next to system/jobs.json."""
+        if self._scope == 'system' and name and '/' not in name:
+            return str(paths.system_source_dir() / name)
+        return name
 
     def _find_nav_view(self):
         """Walk up the widget tree to find the AdwNavigationView."""
@@ -628,10 +782,10 @@ class JobEditorPage(Adw.NavigationPage):
         rsync_options['max_size'] = self._max_size_row.get_text().strip()
         rsync_options['min_size'] = self._min_size_row.get_text().strip()
 
-        return {
+        data = {
             'name': self._name_row.get_text().strip(),
             'description': self._desc_row.get_text().strip() or f'Backup {self._name_row.get_text().strip()}',
-            'source': self._source_row.get_text().strip(),
+            'source': self._source_row.get_text().strip() if self._engine == 'rsync' else '',
             'destination': self._dest_row.get_text().strip(),
             'exclude_file': exclude_file,
             'archive_days': int(self._archive_row.get_value()),
@@ -645,33 +799,114 @@ class JobEditorPage(Adw.NavigationPage):
             }) if self._job_data else {'on_start': True, 'on_complete': True, 'on_error': True},
             'enabled': self._enabled_switch.get_active(),
         }
+        old = self._job_data or {}
+        if self._scope == 'system':
+            data['scope'] = 'system'
+            # A system job belongs to the machine it was set up on.
+            data['hosts'] = old.get('hosts') or [paths.host_name()]
+        if old.get('run_after'):
+            data['run_after'] = old['run_after']
+        if self._engine == 'restic':
+            data['engine'] = 'restic'
+            data.pop('rsync_options')
+            data.pop('archive_days')
+            data.pop('bandwidth_limit_kbps')
+            mode = RESTIC_MODES[self._restic_mode_row.get_selected()]
+            buf = self._paths_view.get_buffer()
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            restic = {
+                'mode': mode,
+                'password_file': self._password_row.get_text().strip(),
+                'keep': {k: int(r.get_value()) for k, r in self._keep_rows.items() if r.get_value() > 0},
+                'prune_every_days': int(self._prune_row.get_value()),
+                'check_every_days': int(self._check_row.get_value()),
+                'check_subset': self._subset_row.get_text().strip() or '5%',
+            }
+            if self._host_row.get_text().strip():
+                restic['host'] = self._host_row.get_text().strip()
+            if mode == 'backup':
+                restic['paths'] = [line.strip() for line in text.splitlines() if line.strip()]
+            elif self._from_ids:
+                restic['from_job'] = self._from_ids[self._from_job_row.get_selected()]
+            data['restic'] = restic
+            if mode == 'backup' and self._scope == 'system' and self._meta_row.get_active():
+                data['pre_command'] = META_COMMAND
+        return data
+
+    def _problem(self, data: dict) -> str:
+        if not data['name']:
+            return 'Name is required'
+        if not data['destination']:
+            return 'Destination path is required'
+        if self._engine == 'rsync':
+            return '' if data['source'] else 'Source path is required'
+        restic = data['restic']
+        if restic['mode'] == 'backup' and not restic.get('paths'):
+            return 'List at least one path to back up'
+        if restic['mode'] == 'backup' and any(not p.startswith('/') for p in restic['paths']):
+            return 'Paths must be absolute'
+        if restic['mode'] == 'copy' and not restic.get('from_job'):
+            return 'Choose the job whose snapshots to copy'
+        if not restic['password_file']:
+            return 'The repository password file is required'
+        return ''
 
     def _on_save(self, btn):
         data = self._collect_form_data()
-
-        # Basic validation
-        if not data['name']:
-            self._show_toast('Name is required')
-            return
-        if not data['source']:
-            self._show_toast('Source path is required')
-            return
-        if not data['destination']:
-            self._show_toast('Destination path is required')
+        problem = self._problem(data)
+        if problem:
+            self._show_toast(problem)
             return
 
         if self._job_id:
             self._manager.update_job(self._job_id, data)
-            self.emit('saved', self._job_id)
         else:
-            job_id = self._manager.create_job(data)
-            self._job_id = job_id
-            self.emit('saved', job_id)
+            self._job_id = self._manager.create_job(data)
+        if self._scope == 'system':
+            self._install_system_jobs(self._job_id, 'saved')
+            return
+        self.emit('saved', self._job_id)
+        self._go_back()
 
-        # Navigate back
+    def _go_back(self):
         nav = self._find_nav_view()
         if nav:
             nav.pop()
+
+    def _install_system_jobs(self, job_id: str, signal: str):
+        """System jobs are saved to the overlay; installing them takes root
+        (`mirror-backup system apply` through pkexec, which asks for the password)."""
+        self._show_toast('Installing the system jobs…')
+        try:
+            proc = Gio.Subprocess.new(self._manager.system_apply_command(),
+                                      Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        except GLib.Error as e:
+            self._show_result('System jobs not installed', e.message)
+            return
+        proc.communicate_utf8_async(None, None, self._on_installed, (job_id, signal))
+
+    def _on_installed(self, proc, result, data):
+        job_id, signal = data
+        try:
+            _, output, _ = proc.communicate_utf8_finish(result)
+        except GLib.Error as e:
+            output = e.message
+        if proc.get_successful():
+            self.emit(signal, job_id)
+            self._go_back()
+            return
+        # 126/127: pkexec was dismissed or not allowed — the change stays saved
+        # in the overlay, and installing it later picks it up.
+        self._show_result('System jobs saved, not installed',
+                          (output or '').strip() + '\n\nInstall them later with:\n'
+                          f'sudo {paths.SYSTEM_COMMAND} system apply')
+        self.emit(signal, job_id)
+
+    def _show_result(self, heading: str, body: str):
+        dialog = Adw.AlertDialog(heading=heading, body=body[:5000])
+        dialog.set_body_use_markup(False)
+        dialog.add_response('ok', 'OK')
+        dialog.present(self.get_root())
 
     def _on_delete(self, btn):
         """Show confirmation dialog before deleting."""
@@ -690,14 +925,18 @@ class JobEditorPage(Adw.NavigationPage):
     def _on_delete_confirmed(self, dialog, response):
         if response == 'delete' and self._job_id:
             self._manager.delete_job(self._job_id)
+            if self._scope == 'system':
+                self._install_system_jobs(self._job_id, 'deleted')
+                return
             self.emit('deleted', self._job_id)
-            nav = self._find_nav_view()
-            if nav:
-                nav.pop()
+            self._go_back()
 
     def _on_dry_run(self, row):
         """Run rsync --dry-run and show results in a dialog."""
         if not self._job_data:
+            return
+        if self._engine == 'restic':
+            self._restic_dry_run()
             return
 
         source = self._source_row.get_text().strip()
@@ -715,7 +954,7 @@ class JobEditorPage(Adw.NavigationPage):
             source, dest,
         ]
 
-        exclude = paths.resolve_config_path(self._exclude_file)
+        exclude = paths.resolve_config_path(self._exclude_path(self._exclude_file))
         if exclude and Path(exclude).is_file():
             args.insert(-2, f'--exclude-from={exclude}')
 
@@ -741,6 +980,31 @@ class JobEditorPage(Adw.NavigationPage):
         dialog.set_body_use_markup(False)
         dialog.add_response('ok', 'OK')
         dialog.present(self.get_root())
+
+    def _restic_dry_run(self):
+        """`mirror-backup dry-run` of the saved job: what its next snapshot
+        would add. A system job's reads every file, so it runs as root."""
+        if (self._job_data.get('restic') or {}).get('mode', 'backup') != 'backup':
+            self._show_toast('A copy job has nothing to preview')
+            return
+        if self._scope == 'system':
+            cmd = ['pkexec', paths.SYSTEM_COMMAND, 'dry-run', self._job_id]
+        else:
+            cmd = [sys.executable, '-m', 'backup_monitor', 'dry-run', self._job_id]
+        self._show_toast('Running dry-run…')
+        try:
+            proc = Gio.Subprocess.new(cmd, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        except GLib.Error as e:
+            self._show_result('Dry Run Results', e.message)
+            return
+
+        def done(p, res, _data):
+            try:
+                _, out, _ = p.communicate_utf8_finish(res)
+            except GLib.Error as e:
+                out = e.message
+            self._show_result('Dry Run Results', (out or '').strip() or '(no output)')
+        proc.communicate_utf8_async(None, None, done, None)
 
     def _show_toast(self, message: str):
         root = self.get_root()

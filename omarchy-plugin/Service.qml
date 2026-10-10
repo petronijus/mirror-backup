@@ -6,8 +6,9 @@ import "Model.js" as Model
 // The widget's data: one long-running `mirror-backup status --watch`, which
 // prints the whole snapshot as a JSON line at start and after every change
 // (it polls the jobs' state files itself — they may sit on NFS, where inotify
-// misses writes from other machines). Controls are plain systemctl calls on
-// the job's service, the same the desktop app and the GNOME extension make.
+// misses writes from other machines). Controls go through `mirror-backup
+// control`, like the desktop app's and the GNOME extension's: it knows whether
+// a job is the user's or a system job (run by root, controlled through polkit).
 Item {
   id: root
 
@@ -45,14 +46,9 @@ Item {
   }
 
   function control(job, action) {
-    if (!job || !job.service) return
-    var args
-    if (action === "start") args = ["start", job.service]
-    else if (action === "stop") args = ["stop", job.service]          // backup-sync SIGCONTs a paused rsync itself
-    else if (action === "pause") args = ["kill", "--signal=USR1", job.service]
-    else if (action === "resume") args = ["kill", "--signal=USR2", job.service]
-    else return
-    Quickshell.execDetached(["systemctl", "--user"].concat(args))
+    if (!job || !job.id) return
+    if (["start", "stop", "pause", "resume"].indexOf(action) < 0) return
+    Quickshell.execDetached([root.command, "control", job.id, action])
     settleTimer.restart()
   }
 

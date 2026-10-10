@@ -144,7 +144,8 @@ class StatusMonitor(GObject.Object):
         for job in self._jobs:
             self._refresh_last_run(job)
         timer_names = [f'{j.id}.timer' for j in self._jobs]
-        systemd_service.get_all_timer_info(timer_names, self._on_timer_info)
+        scopes = {f'{j.id}.timer': j.scope for j in self._jobs}
+        systemd_service.get_all_timer_info(timer_names, self._on_timer_info, scopes)
 
     def _on_timer_info(self, results: dict):
         for job in self._jobs:

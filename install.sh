@@ -3,7 +3,14 @@
 # the job units, and the panel of the desktop in use — the GNOME Shell
 # extension, or the Omarchy bar widget.
 #
-#   ./install.sh [--desktop gnome|omarchy|none]
+#   ./install.sh [--desktop gnome|omarchy|none] [--system]
+#
+# --system also installs, with sudo, what system jobs (run by root) need: a
+# root-owned copy of backup-sync and the app in /usr/local/lib/mirror-backup,
+# the shared queue (/etc/tmpfiles.d), /etc/mirror-backup and the unit that
+# resumes interrupted system runs at boot — then installs the system jobs from
+# ~/.config/backup-sync/system (mirror-backup system apply). See README,
+# "System jobs".
 #
 # Re-running it updates an install in place. With a private overlay that holds
 # jobs (private/configs/backup-sync/jobs.json), the config dir
@@ -23,6 +30,7 @@ APP_HOME="$DATA_HOME/mirror-backup"
 CONFIG_DIR="$CONFIG_HOME/backup-sync"
 UNIT_DIR="$CONFIG_HOME/systemd/user"
 OVERLAY_CONFIG="$SCRIPT_DIR/private/configs/backup-sync"
+SYSTEM_LIB=/usr/local/lib/mirror-backup
 
 step() { printf '\n==> %s\n' "$*"; }
 ok()   { printf '  ✓ %s\n' "$*"; }
@@ -37,10 +45,12 @@ trash() {
 }
 
 DESKTOP=""
+SYSTEM=0
 while (( $# )); do
     case "$1" in
         --desktop) DESKTOP="${2:?--desktop needs gnome, omarchy or none}"; shift 2 ;;
-        -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --system) SYSTEM=1; shift ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -122,6 +132,37 @@ systemctl --user daemon-reload
 systemctl --user enable mirror-backup-resume.service >/dev/null 2>&1
 ok "mirror-backup-resume.service enabled"
 "$BIN_DIR/mirror-backup" sync-units || warn "some units could not be synced (see above)"
+
+if (( SYSTEM )); then
+    step "system part (root) → $SYSTEM_LIB"
+    AS_ROOT=()
+    (( EUID == 0 )) || AS_ROOT=(sudo)
+    # Root runs only what root owns: backup-sync, the pre-commands and the app
+    # are copied, not linked, and rebuilt from the checkout on every run.
+    "${AS_ROOT[@]}" install -d -m 0755 -o root -g root "$SYSTEM_LIB" "$SYSTEM_LIB/app"
+    "${AS_ROOT[@]}" install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/backup-sync" "$SYSTEM_LIB/backup-sync"
+    "${AS_ROOT[@]}" install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/mirror-backup-system" "$SYSTEM_LIB/mirror-backup"
+    "${AS_ROOT[@]}" install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/mirror-backup-system-meta" "$SYSTEM_LIB/mirror-backup-system-meta"
+    "${AS_ROOT[@]}" rsync -a --delete --exclude=__pycache__ --chown=root:root --chmod=D755,F644 \
+        "$SCRIPT_DIR/src/" "$SYSTEM_LIB/app/"
+    ok "backup-sync, mirror-backup, mirror-backup-system-meta and the app"
+    "${AS_ROOT[@]}" install -Dm644 -o root -g root "$SCRIPT_DIR/data/tmpfiles/mirror-backup.conf" /etc/tmpfiles.d/mirror-backup.conf
+    "${AS_ROOT[@]}" systemd-tmpfiles --create /etc/tmpfiles.d/mirror-backup.conf
+    ok "shared queue /run/mirror-backup/queue.lock"
+    "${AS_ROOT[@]}" install -d -m 0755 -o root -g root /etc/mirror-backup
+    "${AS_ROOT[@]}" install -d -m 0700 -o root -g root /etc/mirror-backup/keys
+    "${AS_ROOT[@]}" install -Dm644 -o root -g root "$SCRIPT_DIR/systemd/mirror-backup-resume-system.service" \
+        /etc/systemd/system/mirror-backup-resume-system.service
+    "${AS_ROOT[@]}" systemctl daemon-reload
+    "${AS_ROOT[@]}" systemctl enable mirror-backup-resume-system.service >/dev/null 2>&1
+    ok "mirror-backup-resume-system.service enabled"
+    if [[ -f "$CONFIG_DIR/system/jobs.json" ]]; then
+        "${AS_ROOT[@]}" "$SYSTEM_LIB/mirror-backup" system apply --owner "$(id -un)" \
+            || warn "the system jobs were not installed (see above) — fix, then: sudo $SYSTEM_LIB/mirror-backup system apply"
+    else
+        ok "no system jobs in $CONFIG_DIR/system/jobs.json"
+    fi
+fi
 
 step "desktop entry"
 install -Dm644 /dev/stdin "$DATA_HOME/applications/com.github.petronijus.BackupMonitor.desktop" <<DEOF

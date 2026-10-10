@@ -1,0 +1,13 @@
+# Once per boot: start every system backup that a shutdown, crash or power
+# loss cut short — here, or on the other operating system that shares its
+# destination. The system counterpart of the user unit mirror-backup-resume.
+[Unit]
+Description=Mirror Backup: restart interrupted system backups
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mirror-backup/mirror-backup resume --system
+
+[Install]
+WantedBy=multi-user.target

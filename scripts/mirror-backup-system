@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# mirror-backup, as root — the command system units and pkexec run, installed by
+# `install.sh --system` as /usr/local/lib/mirror-backup/mirror-backup.
+#
+# It runs the root-owned copy of the app in /usr/local/lib/mirror-backup/app,
+# with an isolated interpreter (-I: no PYTHONPATH, no user site-packages, not
+# even the current directory on sys.path), so root never imports a module a
+# user could have changed.
+set -euo pipefail
+LIB=/usr/local/lib/mirror-backup
+exec /usr/bin/python3 -I -c '
+import runpy, sys
+sys.path.insert(0, sys.argv.pop(1))
+sys.argv[0] = "mirror-backup"
+runpy.run_module("backup_monitor", run_name="__main__", alter_sys=True)
+' "$LIB/app" "$@"

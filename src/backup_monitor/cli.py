@@ -2,8 +2,12 @@
 
     status [--json] [--watch]   every job's state (--watch: a JSON line per change);
                                 exits 75 without reading while a suspend is under way
+    control JOB ACTION          start, stop, pause or resume a job, of either scope
+    dry-run JOB                 what a restic backup job's next snapshot would add
     sync-units                  make the systemd units match jobs.json
-    resume                      restart runs postponed or cut short, on any machine
+    resume [--system]           restart runs postponed or cut short, on any machine
+    system apply|init|set-key|restic
+                                system jobs (run by root) — see backup_monitor.system
     migrate-legacy [--from DIR] [--retire] [--dry-run]
                                 move pre-0.6 state (~/.local/share/backup-sync)
                                 into each job's destination
@@ -22,17 +26,19 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from backup_monitor import paths
+from backup_monitor import paths, units
 from backup_monitor.fsutil import atomic_write_text, trash
 from backup_monitor.models.job import is_stale_active
 from backup_monitor.services import snapshot as snap
-from backup_monitor.services.job_manager import JobManager, load_jobs
+from backup_monitor.services.job_manager import (JobManager, load_all_jobs, load_jobs,
+                                                 load_system_jobs)
 from backup_monitor.services.sleep_guard import (LOGIND_NAME, SleepGuard,
                                                  SuspendInProgress, guarded_read)
 
 from gi.repository import GLib  # noqa: E402  (sleep_guard pins the version)
 
-COMMANDS = ('status', 'sync-units', 'resume', 'migrate-legacy')
+COMMANDS = ('status', 'control', 'dry-run', 'sync-units', 'resume', 'system', 'migrate-legacy')
+ACTIONS = ('start', 'stop', 'pause', 'resume')
 
 # `status` while a suspend is under way: nothing was read (EX_TEMPFAIL).
 EXIT_SUSPENDING = 75
@@ -49,8 +55,30 @@ def main(argv: list[str]) -> int:
     p.add_argument('--json', action='store_true', help='machine-readable output')
     p.add_argument('--watch', action='store_true',
                    help='keep running, print a JSON line whenever anything changes')
+    p = sub.add_parser('control', help='start, stop, pause or resume a job')
+    p.add_argument('job')
+    p.add_argument('action', choices=ACTIONS)
+    p = sub.add_parser('dry-run', help="what a restic backup job's next snapshot would add")
+    p.add_argument('job')
     sub.add_parser('sync-units', help='make the systemd units match jobs.json')
-    sub.add_parser('resume', help='restart postponed and interrupted runs')
+    p = sub.add_parser('resume', help='restart postponed and interrupted runs')
+    p.add_argument('--system', action='store_true',
+                   help='the system jobs (root, at boot) instead of the user jobs')
+    p = sub.add_parser('system', help='system jobs, run by root')
+    ssub = p.add_subparsers(dest='system_command', required=True)
+    q = ssub.add_parser('apply', help='check the edited system jobs and install them (root)')
+    q.add_argument('--from', dest='source', type=Path, default=None,
+                   help="the edited jobs (default: the owner's ~/.config/backup-sync/system)")
+    q.add_argument('--owner', default='', help='the user they report to (default: who ran sudo/pkexec)')
+    q.add_argument('--dry-run', action='store_true', help='only show what would change')
+    q = ssub.add_parser('init', help="create a restic job's destination and repository (root)")
+    q.add_argument('job')
+    q = ssub.add_parser('set-key', help='store a repository password read from stdin (root)')
+    q.add_argument('name')
+    q.add_argument('--replace', action='store_true', help='replace a different existing key')
+    q = ssub.add_parser('restic', help="run restic on a job's repository (root)")
+    q.add_argument('job')
+    q.add_argument('args', nargs=argparse.REMAINDER, help='restic arguments, after --')
     p = sub.add_parser('migrate-legacy', help='move pre-0.6 state into the destinations')
     p.add_argument('--from', dest='source', type=Path, default=None,
                    help='legacy data dir (default: $XDG_DATA_HOME/backup-sync)')
@@ -63,10 +91,16 @@ def main(argv: list[str]) -> int:
         if args.watch:
             return watch_status()
         return print_status(as_json=args.json)
+    if args.command == 'control':
+        return control(args.job, args.action)
+    if args.command == 'dry-run':
+        return dry_run(args.job)
     if args.command == 'sync-units':
         return sync_units()
     if args.command == 'resume':
-        return resume()
+        return resume(system=args.system)
+    if args.command == 'system':
+        return system_command(args)
     return migrate_legacy(args.source or paths.legacy_data_dir(),
                           retire=args.retire, dry_run=args.dry_run)
 
@@ -78,7 +112,7 @@ def print_status(as_json: bool) -> int:
     # suspend. Hold logind off for the read, or do not read at all.
     try:
         with guarded_read(GUARD_WHO, 'Reading backup status'):
-            data = snap.snapshot(load_jobs())
+            data = snap.snapshot(load_all_jobs())
     except SuspendInProgress:
         print('mirror-backup: a suspend is under way, not reading the destinations',
               file=sys.stderr)
@@ -139,7 +173,7 @@ class StatusWatch:
         self._signal_sources: list[int] = []
         self._asleep = False
         self._jobs: list[dict] = []
-        self._jobs_mtime: float | None = None
+        self._jobs_mtime: tuple | None = None
         self._timers: dict = {}
         self._timers_at = 0.0
         self._last_line: str | None = None
@@ -177,14 +211,14 @@ class StatusWatch:
 
     def poll(self) -> float:
         """One round: print what changed; returns the seconds until the next."""
-        mtime = _mtime(paths.jobs_file())
+        mtime = (_mtime(paths.jobs_file()), _mtime(paths.system_jobs_file()))
         if mtime != self._jobs_mtime:
-            self._jobs, self._jobs_mtime = load_jobs(), mtime
+            self._jobs, self._jobs_mtime = load_all_jobs(), mtime
             self._timers_at = 0.0
         data = snap.snapshot(self._jobs, timers={})
         states = [(j['id'], j['status']['state']) for j in data['jobs']]
         if states != self._last_states or time.monotonic() - self._timers_at > self.TIMERS_S:
-            self._timers = snap.timer_info([j['id'] for j in self._jobs])
+            self._timers = snap.jobs_timer_info(self._jobs)
             self._timers_at = time.monotonic()
             self._last_states = states
         for job in data['jobs']:
@@ -238,21 +272,73 @@ def sync_units() -> int:
     report = JobManager().sync_units()
     if not report.changed and not report.unmanaged and not report.errors:
         print('units up to date')
+    _warn_system_drift()
     return 1 if report.errors else 0
+
+
+def _warn_system_drift():
+    """System jobs edited but not installed — only root can install them, so
+    say so where the user sees it (this runs at login, from the resume unit)."""
+    from backup_monitor import system
+    changed = system.drift()
+    if not changed:
+        return
+    print(f'system jobs changed but not installed — run: sudo {paths.SYSTEM_COMMAND} system apply')
+    for path in changed:
+        print(f'  {path}')
+    subprocess.run(['gdbus', 'call', '--session', '--dest=org.freedesktop.Notifications',
+                    '--object-path=/org/freedesktop/Notifications',
+                    '--method=org.freedesktop.Notifications.Notify', 'Mirror Backup', '0',
+                    'drive-harddisk', 'System backup jobs changed',
+                    f'Install them with: sudo {paths.SYSTEM_COMMAND} system apply', '[]', '{}', '0'],
+                   capture_output=True, timeout=10)
+
+
+# ── control ──
+
+def control(job_id: str, action: str) -> int:
+    """One place that knows how to start, stop, pause and resume a job, of
+    either scope; the app and both panels call it. Pause and resume signal
+    backup-sync alone (--kill-whom=main): it stops and continues its child —
+    restic, unlike rsync, would die of a SIGUSR1 of its own."""
+    job = next((j for j in load_all_jobs() if j['id'] == job_id), None)
+    if job is None:
+        print(f'mirror-backup: no job {job_id!r} on this host', file=sys.stderr)
+        return 2
+    scope = units.job_scope(job)
+    service = f'{job_id}.service'
+    signal_arg = {'pause': 'USR1', 'resume': 'USR2'}
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return _systemctl(*args, scope=scope)
+
+    if action == 'start':
+        result = run('start', '--no-block', service)
+    elif action == 'stop':
+        # backup-sync continues a paused run itself before stopping it.
+        result = run('stop', '--no-block', service)
+    else:
+        result = run('kill', '--kill-whom=main', f'--signal={signal_arg[action]}', service)
+    if result.returncode != 0:
+        print(f'mirror-backup: {action} {job_id}: {result.stderr.strip()}', file=sys.stderr)
+    return result.returncode
 
 
 # ── resume ──
 
-def _systemctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(['systemctl', '--user', *args],
+def _systemctl(*args: str, scope: str = 'user') -> subprocess.CompletedProcess:
+    return subprocess.run(['systemctl', f'--{scope}', *args],
                           capture_output=True, text=True, timeout=30)
 
 
-def resume() -> int:
+def resume(*, system: bool = False) -> int:
     """Start every job whose last run did not get to finish: postponed ones
     (a ``deferred`` marker) and ones whose machine went down under them — a
-    crash, power loss, or simply the other operating system being booted."""
-    for job in load_jobs():
+    crash, power loss, or simply the other operating system being booted.
+    ``system``: the system jobs (run by root from a system unit at boot)."""
+    scope = 'system' if system else 'user'
+    jobs = load_system_jobs() if system else load_jobs()
+    for job in (j for j in jobs if units.runs_here(j)):
         job_id, destination = job['id'], job['destination']
         state = paths.job_paths(destination)
         if not state.available:
@@ -264,13 +350,46 @@ def resume() -> int:
             reason = 'interrupted'
         else:
             continue
-        load = _systemctl('show', '-P', 'LoadState', f'{job_id}.service').stdout.strip()
+        load = _systemctl('show', '-P', 'LoadState', f'{job_id}.service', scope=scope).stdout.strip()
         if load != 'loaded':
             print(f'{job_id}: unit not loaded ({load or "unknown"}), not restarting its {reason} run')
             continue
         print(f'{job_id}: restarting {reason} run')
-        _systemctl('start', '--no-block', f'{job_id}.service')
+        _systemctl('start', '--no-block', f'{job_id}.service', scope=scope)
     return 0
+
+
+# ── dry run ──
+
+def dry_run(job_id: str) -> int:
+    from backup_monitor import system
+    job = next((j for j in load_all_jobs() if j['id'] == job_id), None)
+    if job is None:
+        print(f'mirror-backup: no job {job_id!r} on this host', file=sys.stderr)
+        return 2
+    try:
+        return system.dry_run(job)
+    except system.SystemError_ as e:
+        print(f'mirror-backup dry-run: {e}', file=sys.stderr)
+        return 1
+
+
+# ── system jobs ──
+
+def system_command(args) -> int:
+    from backup_monitor import system
+    try:
+        if args.system_command == 'apply':
+            return system.apply(args.source, dry_run=args.dry_run, owner=args.owner)
+        if args.system_command == 'init':
+            return system.init(args.job)
+        if args.system_command == 'set-key':
+            return system.set_key(args.name, replace=args.replace)
+        rest = args.args[1:] if args.args[:1] == ['--'] else args.args
+        return system.restic_exec(args.job, rest)
+    except system.SystemError_ as e:
+        print(f'mirror-backup system: {e}', file=sys.stderr)
+        return 1
 
 
 # ── migration from pre-0.6 ──

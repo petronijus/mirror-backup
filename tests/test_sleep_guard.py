@@ -264,7 +264,7 @@ class StatusCommandTest(FakeBus):
         for target, value in (
             ('backup_monitor.cli.guarded_read',
              functools.partial(sg.guarded_read, connection=self.conn, name=FAKE_NAME)),
-            ('backup_monitor.cli.load_jobs', lambda: []),
+            ('backup_monitor.cli.load_all_jobs', lambda: []),
             ('backup_monitor.services.snapshot.snapshot', fake_snapshot),
         ):
             patcher = mock.patch(target, value)
@@ -296,10 +296,10 @@ class StatusWatchTest(FakeBus):
             return {'config': '', 'jobs': [{'id': 'j', 'status': {'state': 'idle'}}]}
 
         for target, value in (
-            ('backup_monitor.cli.load_jobs', lambda: [{'id': 'j'}]),
+            ('backup_monitor.cli.load_all_jobs', lambda: [{'id': 'j'}]),
             ('backup_monitor.cli._mtime', lambda _p: 1.0),
             ('backup_monitor.services.snapshot.snapshot', fake_snapshot),
-            ('backup_monitor.services.snapshot.timer_info', lambda _ids: {}),
+            ('backup_monitor.services.snapshot.jobs_timer_info', lambda _jobs: {}),
         ):
             patcher = mock.patch(target, value)
             patcher.start()
@@ -357,7 +357,7 @@ class StatusMonitorTest(FakeBus):
     def setUp(self):
         super().setUp()
         patcher = mock.patch.object(status_monitor.systemd_service, 'get_all_timer_info',
-                                    lambda _names, callback: callback({}))
+                                    lambda _names, callback, _scopes=None: callback({}))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.monitor = status_monitor.StatusMonitor(

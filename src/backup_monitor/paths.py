@@ -16,6 +16,20 @@ Three places, three lifetimes:
     Queue lock, PID files and rsync progress output. Meaningful for the current
     boot only, which is exactly the lifetime of a runtime directory.
 
+System jobs (scope ``system``: run by root, see ``system``) have their own:
+
+``/etc/mirror-backup``           the installed jobs (``jobs.json``), their exclude
+                                 files, repository keys (``keys/``) and the
+                                 generated path lists (``generated/``)
+``config/system``                where they are edited — inside the user's config
+                                 dir, so the overlay that holds the user jobs
+                                 holds them too; ``mirror-backup system apply``
+                                 installs them
+``/usr/local/lib/mirror-backup`` the root-owned copy of backup-sync and the app
+                                 that system units run
+``/run/mirror-backup``           their runtime files, and the queue lock that
+                                 jobs of both scopes share
+
 ``scripts/backup-sync`` resolves the same paths in bash; keep the two in step.
 """
 
@@ -27,6 +41,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATE_DIRNAME = '.mirror-backup'
+SYSTEM_LIB_DIR = '/usr/local/lib/mirror-backup'
+# The root-owned command; root must never run the user's ~/.local/bin copy.
+SYSTEM_COMMAND = f'{SYSTEM_LIB_DIR}/mirror-backup'
+SYSTEM_RUN_DIR = '/run/mirror-backup'
+SYSTEM_UNIT_DIR = Path('/etc/systemd/system')
 
 
 def _xdg(var: str, fallback: Path) -> Path:
@@ -52,6 +71,31 @@ def systemd_user_dir() -> Path:
 
 def runtime_dir() -> Path:
     return _xdg('XDG_RUNTIME_DIR', Path(f'/run/user/{os.getuid()}')) / 'backup-sync'
+
+
+def system_config_dir() -> Path:
+    """The installed system jobs. MIRROR_BACKUP_SYSTEM_CONFIG moves it (tests)."""
+    return Path(os.environ.get('MIRROR_BACKUP_SYSTEM_CONFIG') or '/etc/mirror-backup')
+
+
+def system_jobs_file() -> Path:
+    return system_config_dir() / 'jobs.json'
+
+
+def system_source_dir() -> Path:
+    """Where the system jobs are edited, before `mirror-backup system apply`."""
+    return config_dir() / 'system'
+
+
+def unit_dir(scope: str) -> Path:
+    return SYSTEM_UNIT_DIR if scope == 'system' else systemd_user_dir()
+
+
+def generated_dir(scope: str) -> Path:
+    """Files generated next to the units: the path lists of restic jobs."""
+    if scope == 'system':
+        return system_config_dir() / 'generated'
+    return _xdg('XDG_DATA_HOME', Path.home() / '.local' / 'share') / 'mirror-backup' / 'generated'
 
 
 def legacy_data_dir() -> Path:

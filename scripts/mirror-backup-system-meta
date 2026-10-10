@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# mirror-backup-system-meta — the pre-command of a system backup: writes down
+# what a restore onto bare metal needs and the files alone do not say.
+#
+#   ${STATE_DIRECTORY:-/var/lib/mirror-backup}/meta/
+#       taken-at, os-release, uname   which system this was, and when
+#       packages-*.txt, flatpak.txt   what was installed (pacman, dpkg/apt, snap, flatpak)
+#       lsblk.txt, blkid.txt, findmnt.txt, fstab, crypttab
+#       partitions-<disk>.sfdisk      partition tables (sfdisk -d, restorable with sfdisk)
+#       btrfs-subvolumes.txt          the subvolume layout of a btrfs root
+#       luks-<dev>.dump/.img          LUKS header dumps and header backups
+#       efibootmgr.txt                the firmware boot entries
+#
+# The directory is part of the snapshot taken right after (it lies under /), so
+# every snapshot carries the layout it was taken from. A command that fails
+# leaves its message in <name>.err and the others still run: missing metadata
+# must not cost the backup. Runs as root, from Mirror Backup's system units.
+set -uo pipefail
+umask 077
+
+OUT="${STATE_DIRECTORY:-/var/lib/mirror-backup}"
+OUT="${OUT%%:*}/meta"
+NEXT="$OUT.next"
+# The previous run's copy is in yesterday's snapshot; what is left of a run
+# that died halfway is this script's own output, never anything else.
+rm -rf -- "$NEXT"
+mkdir -p -- "$NEXT"
+cd -- "$NEXT" || exit 1
+
+# run <file> <command…>: stdout into <file>, errors into <file>.err
+run() {
+    local file="$1" rc=0
+    shift
+    "$@" > "$file" 2> "$file.err" || rc=$?
+    (( rc )) && echo "exit $rc" >> "$file.err"
+    [[ -s "$file.err" ]] || rm -f -- "$file.err"
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+
+date -Iseconds > taken-at
+uname -a > uname
+cp /etc/os-release os-release 2>/dev/null
+cp /etc/fstab fstab 2>/dev/null
+[[ -f /etc/crypttab ]] && cp /etc/crypttab crypttab
+
+if have pacman; then
+    run packages-pacman-native.txt pacman -Qqen
+    run packages-pacman-foreign.txt pacman -Qqem
+fi
+if have dpkg-query; then
+    run packages-dpkg.txt dpkg-query -W -f '${Package}\t${Version}\n'
+    have apt-mark && run packages-apt-manual.txt apt-mark showmanual
+fi
+have snap && run snaps.txt snap list
+have flatpak && run flatpak.txt flatpak list --columns=application,origin,branch,installation
+
+run lsblk.txt lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,PARTUUID,MOUNTPOINTS
+run blkid.txt blkid
+run findmnt.txt findmnt -A -o TARGET,SOURCE,FSTYPE,OPTIONS
+while read -r disk type; do
+    [[ "$type" == disk && "$disk" != /dev/zram* && "$disk" != /dev/loop* ]] || continue
+    run "partitions-${disk##*/}.sfdisk" sfdisk -d "$disk"
+done < <(lsblk -dnpo NAME,TYPE)
+if [[ "$(findmnt -no FSTYPE /)" == btrfs ]] && have btrfs; then
+    run btrfs-subvolumes.txt btrfs subvolume list -a /
+fi
+if have cryptsetup; then
+    while read -r dev; do
+        [[ -n "$dev" ]] || continue
+        run "luks-${dev##*/}.dump" cryptsetup luksDump "$dev"
+        run "luks-${dev##*/}.log" cryptsetup luksHeaderBackup "$dev" --header-backup-file "luks-${dev##*/}.img"
+    done < <(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null)
+fi
+have efibootmgr && run efibootmgr.txt efibootmgr -v
+
+cd / || exit 1
+rm -rf -- "$OUT"
+mv -- "$NEXT" "$OUT"
+echo "metadata for a bare-metal restore written to $OUT"

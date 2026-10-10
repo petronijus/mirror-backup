@@ -10,18 +10,19 @@ from __future__ import annotations
 import subprocess
 from datetime import datetime
 
-from backup_monitor import paths
+from backup_monitor import paths, units
 from backup_monitor.models.job import read_status
 from backup_monitor.models.job_history import last_run
+from backup_monitor.services.job_manager import source_label
 
 
-def timer_info(job_ids: list[str]) -> dict[str, dict]:
+def timer_info(job_ids: list[str], scope: str = 'user') -> dict[str, dict]:
     """Next elapse and enablement of each job's timer, from one systemctl call."""
     if not job_ids:
         return {}
     try:
         result = subprocess.run(
-            ['systemctl', '--user', 'show', '--timestamp=unix',
+            ['systemctl', f'--{scope}', 'show', '--timestamp=unix',
              '--property=Id,NextElapseUSecRealtime,UnitFileState,ActiveState',
              *[f'{j}.timer' for j in job_ids]],
             capture_output=True, text=True, timeout=10)
@@ -38,6 +39,14 @@ def timer_info(job_ids: list[str]) -> dict[str, dict]:
             'timer_enabled': props.get('UnitFileState') == 'enabled',
             'timer_active': props.get('ActiveState') == 'active',
         }
+    return info
+
+
+def jobs_timer_info(jobs: list[dict]) -> dict[str, dict]:
+    """timer_info for jobs of both scopes: one systemctl call per scope."""
+    info: dict[str, dict] = {}
+    for scope in ('user', 'system'):
+        info.update(timer_info([j['id'] for j in jobs if units.job_scope(j) == scope], scope))
     return info
 
 
@@ -61,7 +70,9 @@ def job_snapshot(job: dict, timers: dict[str, dict], boot: str) -> dict:
         'id': job['id'],
         'name': job.get('name', job['id']),
         'service': f'{job["id"]}.service',
-        'source': job.get('source', ''),
+        'scope': units.job_scope(job),
+        'engine': units.job_engine(job),
+        'source': source_label(job),
         'destination': destination,
         'schedule': job.get('schedule', {}).get('expression', '')
         if job.get('schedule', {}).get('type', 'calendar') != 'manual' else '',
@@ -82,10 +93,11 @@ def job_snapshot(job: dict, timers: dict[str, dict], boot: str) -> dict:
 def snapshot(jobs: list[dict], timers: dict[str, dict] | None = None) -> dict:
     boot = paths.boot_id()
     if timers is None:
-        timers = timer_info([j['id'] for j in jobs])
+        timers = jobs_timer_info(jobs)
     return {
         'host': paths.host_name(),
         'config': str(paths.jobs_file()),
+        'system_config': str(paths.system_jobs_file()),
         'jobs': [job_snapshot(j, timers, boot) for j in jobs],
     }
 

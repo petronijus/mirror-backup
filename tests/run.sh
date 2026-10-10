@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # As scripts/mirror-backup: the system interpreter, which has PyGObject.
 PYTHON="${MIRROR_BACKUP_PYTHON:-/usr/bin/python3}"
-bash -n install.sh build.sh uninstall.sh scripts/backup-sync scripts/mirror-backup scripts/vendor-adw-omarchy.sh
+bash -n install.sh build.sh uninstall.sh scripts/backup-sync scripts/mirror-backup scripts/vendor-adw-omarchy.sh \
+    scripts/mirror-backup-system scripts/mirror-backup-system-meta
 "$PYTHON" -m unittest discover -s tests
 if command -v node >/dev/null; then
     node tests/test_omarchy_model.mjs

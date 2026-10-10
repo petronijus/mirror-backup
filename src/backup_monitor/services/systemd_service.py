@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 
 import gi
@@ -9,11 +10,11 @@ gi.require_version('Gio', '2.0')
 from gi.repository import Gio, GLib
 
 
-def _run_systemctl(args: list[str], callback=None):
-    """Run systemctl --user with given args asynchronously."""
+def _run_systemctl(args: list[str], callback=None, scope: str = 'user'):
+    """Run systemctl (--user, or --system for a system job's units) asynchronously."""
     try:
         proc = Gio.Subprocess.new(
-            ['systemctl', '--user', *args],
+            ['systemctl', f'--{scope}', *args],
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
         )
         proc.communicate_utf8_async(None, None, _on_done, callback)
@@ -33,25 +34,47 @@ def _on_done(proc, result, callback):
             callback('', str(e))
 
 
+def _control(service_name: str, action: str):
+    """`mirror-backup control`, run with this very interpreter and app: it
+    knows a job's scope — a system job is a system unit, started through polkit."""
+    job_id = service_name.removesuffix('.service')
+    try:
+        proc = Gio.Subprocess.new(
+            [sys.executable, '-m', 'backup_monitor', 'control', job_id, action],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        )
+        proc.communicate_utf8_async(None, None, _on_control_done, f'{action} {job_id}')
+    except GLib.Error as e:
+        print(f'[BackupMonitor] mirror-backup control error: {e.message}')
+
+
+def _on_control_done(proc, result, what):
+    try:
+        _, _stdout, stderr = proc.communicate_utf8_finish(result)
+        if not proc.get_successful():
+            print(f'[BackupMonitor] {what}: {(stderr or "").strip()}')
+    except GLib.Error as e:
+        print(f'[BackupMonitor] {what}: {e.message}')
+
+
 def start_job(service_name: str):
-    _run_systemctl(['start', service_name])
+    _control(service_name, 'start')
 
 
 def stop_job(service_name: str, is_paused: bool = False):
-    if is_paused:
-        _run_systemctl(['kill', '--signal=USR2', service_name])
-    _run_systemctl(['stop', service_name])
+    # backup-sync resumes a paused run itself before stopping it.
+    _control(service_name, 'stop')
 
 
 def pause_job(service_name: str):
-    _run_systemctl(['kill', '--signal=USR1', service_name])
+    _control(service_name, 'pause')
 
 
 def resume_job(service_name: str):
-    _run_systemctl(['kill', '--signal=USR2', service_name])
+    _control(service_name, 'resume')
 
 
-def get_timer_info(timer_name: str, callback):
+def get_timer_info(timer_name: str, callback, scope: str = 'user'):
     """Get next/last trigger times for a timer.
 
     callback(next_run_iso: str, last_run_iso: str, error: str | None)
@@ -62,6 +85,7 @@ def get_timer_info(timer_name: str, callback):
          '--property=NextElapseUSecRealtime',
          '--property=LastTriggerUSec'],
         lambda stdout, err: _parse_timer_info(stdout, err, callback),
+        scope,
     )
 
 
@@ -84,8 +108,10 @@ def _parse_timer_info(stdout: str, error, callback):
     callback(next_run, last_run, None)
 
 
-def get_all_timer_info(timer_names: list[str], callback):
-    """Get timer info for multiple timers. callback(dict[timer_name, (next_iso, last_iso)])"""
+def get_all_timer_info(timer_names: list[str], callback, scopes: dict[str, str] | None = None):
+    """Get timer info for multiple timers. callback(dict[timer_name, (next_iso, last_iso)]).
+    ``scopes`` names the manager of each timer that is not the user's."""
+    scopes = scopes or {}
     results = {}
     remaining = [len(timer_names)]
 
@@ -103,6 +129,7 @@ def get_all_timer_info(timer_names: list[str], callback):
         get_timer_info(
             name,
             lambda nr, lr, e, n=name: on_one(n, nr, lr, e),
+            scopes.get(name, 'user'),
         )
 
 

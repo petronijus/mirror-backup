@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "petronijus.mirror-backup",
   "name": "Mirror Backup",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "author": "Petr Parkan Janda",
   "license": "MIT",
-  "description": "Mirror Backup's rsync jobs in the Omarchy bar: live progress, schedule, last run on any machine, start / pause / stop.",
+  "description": "Mirror Backup's jobs — rsync mirrors and restic snapshots, user and system — in the Omarchy bar: live progress, schedule, last run on any machine, start / pause / stop.",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "Panel.qml" },
   "barWidget": {

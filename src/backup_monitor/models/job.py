@@ -16,8 +16,25 @@ PHASE_LABELS = {
     'deleting': 'Finding deleted files',
     'checking': 'Comparing with the mirror',
     'pruning': 'Removing expired archives',
+    # restic (backup-sync's "restic engine")
+    'prepare': 'Preparing',
+    'snapshot': 'Taking a snapshot',
+    'copy': 'Copying snapshots',
+    'forget': 'Applying retention',
+    'prune': 'Pruning the repository',
+    'verify': 'Checking the repository',
 }
 _PHASE_UNITS = {'listing': 'files', 'deleting': 'folders', 'checking': 'checked'}
+
+
+def format_size(n: int) -> str:
+    """1536 → '1.5 KiB' — the way restic itself reports sizes."""
+    size = float(n)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if size < 1024 or unit == 'TiB':
+            return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+        size /= 1024
+    return f'{n} B'
 
 
 @dataclass
@@ -42,6 +59,9 @@ class BackupStatus:
     phase_done: int = 0
     phase_total: int = 0           # 0 = not known
     phase_estimated: bool = False  # phase_total is the previous run's count
+    # restic phases count bytes, packs or snapshots instead of files
+    phase_unit: str = ''
+    engine: str = 'rsync'
     consecutive_failures: int = 0
     suggested_excludes: list[str] = field(default_factory=list)
     # 'suspend' or 'shutdown' while postponed; 'interrupted' for a run that
@@ -80,7 +100,19 @@ class BackupStatus:
 
     @property
     def phase_count(self) -> str:
-        """How far the phase has got: '1,027 / ~2,578,214 files'."""
+        """How far the phase has got: '1,027 / ~2,578,214 files'; for a
+        restic snapshot '1.2 GiB / 4.5 GiB  ·  9,512 / 40,113 files'."""
+        if self.phase_unit == 'bytes':
+            text = format_size(self.phase_done)
+            if self.phase_total:
+                text += f' / {format_size(self.phase_total)}'
+            if self.files_total:
+                text += f'  \u00b7  {self.files_transferred:,} / {self.files_total:,} files'
+            return text
+        if self.phase_unit:
+            if self.phase_total:
+                return f'{self.phase_done:,} / {self.phase_total:,} {self.phase_unit}'
+            return f'{self.phase_done:,} {self.phase_unit}' if self.phase_done else ''
         unit = _PHASE_UNITS.get(self.phase)
         if unit is None:
             return ''
@@ -109,6 +141,8 @@ class BackupStatus:
             'phase_done': self.phase_done,
             'phase_total': self.phase_total,
             'phase_estimated': self.phase_estimated,
+            'phase_unit': self.phase_unit,
+            'engine': self.engine,
             # Worded once here, so every panel says the same.
             'phase_label': self.phase_label,
             'phase_count': self.phase_count,
@@ -163,6 +197,8 @@ def read_status(destination: str, *, current_boot: str | None = None) -> BackupS
         phase_done=int(_number(data.get('phase_done'))),
         phase_total=int(_number(data.get('phase_total'))),
         phase_estimated=data.get('phase_estimated') is True,
+        phase_unit=str(data.get('phase_unit', '')),
+        engine=str(data.get('engine', '') or 'rsync'),
         consecutive_failures=int(_number(data.get('consecutive_failures'))),
         suggested_excludes=[str(s) for s in data.get('suggested_excludes', []) or []],
         deferred_reason=str(data.get('deferred_reason', '')),
@@ -198,6 +234,7 @@ def _clear_progress(st: BackupStatus):
     st.phase_done = 0
     st.phase_total = 0
     st.phase_estimated = False
+    st.phase_unit = ''
 
 
 def _number(value) -> float:
@@ -227,6 +264,8 @@ class BackupJob:
     exclude_file: str = ''
     archive_days: int = 0
     description: str = ''
+    scope: str = 'user'      # 'system': run by root from a system unit
+    engine: str = 'rsync'    # 'restic': snapshots instead of a mirror
     status: BackupStatus = field(default_factory=BackupStatus)
 
     # Scheduling: next_run from this machine's timer, last_run from the job's

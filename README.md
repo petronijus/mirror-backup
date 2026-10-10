@@ -1,8 +1,8 @@
 # Mirror Backup
 
-> Scheduled rsync mirroring, watched live from your panel — GNOME Shell or Omarchy.
+> Scheduled rsync mirrors and restic snapshots, watched live from your panel — GNOME Shell or Omarchy.
 
-Rsync-based backup for Linux with systemd scheduling, a panel indicator (GNOME Shell, or the Omarchy bar), and a GTK4/libadwaita desktop app — set up jobs once, watch them in the corner of your eye. Several installs can share one set of jobs and one state — the two operating systems of a dual boot, say — and each run counts for all of them.
+Backup for Linux with systemd scheduling, a panel indicator (GNOME Shell, or the Omarchy bar), and a GTK4/libadwaita desktop app — set up jobs once, watch them in the corner of your eye. A job either **mirrors** a folder with rsync (plain files, latest state) or keeps **snapshots** of any set of paths with restic (every version, deduplicated, encrypted) — and runs either as you or, for a backup of the whole system, as root. Several installs can share one set of jobs and one state — the two operating systems of a dual boot, say — and each run counts for all of them.
 
 ## Screenshots
 
@@ -18,10 +18,13 @@ Rsync-based backup for Linux with systemd scheduling, a panel indicator (GNOME S
 ## Components
 
 ```
-backup-sync (bash)           — rsync wrapper with progress tracking, job queue & notifications
+backup-sync (bash)           — runs a job (rsync or restic) with progress tracking, job queue & notifications
 systemd user timers          — scheduling (persistent, survives reboots), generated from jobs.json
-mirror-backup (command)      — the app, and `status` / `sync-units` / `resume` / `migrate-legacy`
+mirror-backup (command)      — the app, and `status` / `control` / `dry-run` / `sync-units` / `resume` /
+                               `system` / `migrate-legacy`
 mirror-backup-resume.service — at login: syncs the units with jobs.json, restarts interrupted runs
+system part (--system)       — root-owned copy in /usr/local/lib/mirror-backup, system units for
+                               system jobs, the shared queue, a polkit rule for their controls
 GNOME Shell extension        — panel indicator with live status, controls
 Omarchy bar widget           — the same in the Omarchy (Hyprland) bar
 Desktop app (GTK4)           — job management, configuration, history, logs
@@ -40,6 +43,7 @@ The GTK4/libadwaita desktop app provides full backup management:
 
 ### Job Management
 - Create, edit, delete backup jobs from the UI
+- Kind of job: mirror (rsync) or snapshots (restic) — paths to back up, or another job to copy, retention, prune and check intervals; runs as you or as a system job (saving one installs it through pkexec)
 - Source/destination folder pickers
 - Visual schedule editor:
   - **Weekly**: weekday pill buttons (multi-select), interval spinner ("every N weeks")
@@ -50,8 +54,9 @@ The GTK4/libadwaita desktop app provides full backup management:
   - Human-readable summary (e.g. "Every week on Mon, Wed, Fri at 22:00")
   - Daily = weekly with all 7 days selected
 - Visual exclusion pattern editor (add/remove/toggle patterns)
-- Jobs stored in `~/.config/backup-sync/jobs.json`
+- Jobs stored in `~/.config/backup-sync/jobs.json`, system jobs in `~/.config/backup-sync/system/jobs.json`
 - Generates systemd service+timer units on save
+- Dry run: rsync's file list, or what a restic job's next snapshot would add
 
 ### Advanced Rsync Options (per job)
 - **Delete mode**: before/during/after transfer, or disabled (additive backup)
@@ -102,6 +107,101 @@ adds Mirror Backup's own widgets. `MIRROR_BACKUP_THEME=adwaita` (or `omarchy`) o
 ```bash
 ./run.sh
 ```
+
+## Snapshots (restic)
+
+A job with `"engine": "restic"` keeps snapshots in a restic repository,
+`<destination>/repo`, instead of mirroring. Every run is a point in time to go
+back to; unchanged data is stored once, everything is compressed and encrypted,
+and owners, modes and extended attributes are kept whatever file system the
+repository sits on. The price: the backup is not a folder of plain files —
+reading it takes restic and the password ([docs/restore.md](docs/restore.md)).
+Mirrors suit big media that rarely change; snapshots suit systems, homes and
+projects, where yesterday's version matters.
+
+```jsonc
+{ "id": "backup-system", "name": "System", "engine": "restic",
+  "destination": "/mnt/nas/backup/omarchy",       // repo + .mirror-backup inside
+  "exclude_file": "system.exclude",                            // restic patterns
+  "restic": {
+    "mode": "backup",                        // or "copy" (see below)
+    "paths": ["/", "/boot", "/home"],        // each one on its own file system (--one-file-system)
+    "host": "omarchy",                       // snapshots are taken, copied and thinned per host
+    "password_file": "/etc/mirror-backup/keys/main.key",
+    "keep": {"daily": 7, "weekly": 4, "monthly": 6},
+    "prune_every_days": 7, "check_every_days": 7, "check_subset": "5%" },
+  "schedule": {"type": "calendar", "expression": "*-*-* 12:00:00"} }
+```
+
+A run goes through these phases, each shown in the panels with its own progress:
+
+| Phase | What happens |
+|-------|--------------|
+| `prepare` | the job's pre-command (if any), then `restic unlock` — only locks of runs that died |
+| `snapshot` | `restic backup` of the listed paths (mode `backup`) |
+| `copy` | `restic copy` of this host's snapshots from another job's repository (mode `copy`) |
+| `forget` | retention: `restic forget --host … --keep-…`, grouped by host |
+| `prune` | removes the data no snapshot needs any more — every `prune_every_days` days |
+| `verify` | `restic check --read-data-subset` — every `check_every_days` days |
+
+**Copy jobs** give a second, independent copy: `"mode": "copy"` with
+`"from_job": "<a restic job>"` copies that job's snapshots into its own
+repository (initialised with the same chunker parameters, so the copies
+deduplicate the same way) and applies a retention of its own. `"run_after":
+"<job>"` starts it right after that job succeeds; its own schedule catches up
+when that did not happen.
+
+**Safety rules** on top of those of all jobs: a repository is never created by
+a run (`mirror-backup system init <job>` or `restic init` does that once — an
+empty directory where a repository should be is a missing mount far more often
+than a new job); every listed path must be on a mounted file system, or the
+run is refused rather than snapshot an empty mount point; restic's exit 3
+(some files unreadable) is a warning with the unreadable paths offered as
+excludes, not a failure; a failed `verify` is a critical notification at once.
+
+## System jobs
+
+A user job can read only what its user can. A backup of the whole system has to
+read every file and keep every owner — that takes root. Jobs with `"scope":
+"system"` run as root, from system units, and are kept apart from the user's:
+
+* **Edited** in `~/.config/backup-sync/system/` — `jobs.json`, the exclude files
+  it names, and `mounts/`, systemd mount and automount units for destination
+  disks (below `/mnt` or `/media`). It sits in the user's config dir, so the
+  private overlay that carries the user jobs carries these too.
+* **Installed** with `sudo /usr/local/lib/mirror-backup/mirror-backup system
+  apply` (the app asks through pkexec when you save one): checked strictly,
+  shown as a diff, copied to `/etc/mirror-backup`, turned into system units
+  and the polkit rule. Root never reads its jobs from a file the user can
+  write, and never runs a program the user can change — backup-sync, the app
+  and the pre-commands it may run come from the root-owned copy in
+  `/usr/local/lib/mirror-backup` (`install.sh --system`). A system job's
+  `pre_command` can only name a program shipped there; today that is
+  `mirror-backup-system-meta`, which writes down partition tables, LUKS
+  headers, the btrfs layout and package lists for a bare-metal restore.
+* **Controlled** by the user who applied them: a generated polkit rule lets
+  that user, in an active local session, start, stop, pause and resume exactly
+  these units — so the panels work for them as for any job — and their
+  notifications go to that user's session.
+* **Keys** never pass through the jobs: `sudo …/mirror-backup system set-key
+  <name> < password` stores one as `/etc/mirror-backup/keys/<name>.key` (root,
+  0600); a different existing key is only replaced with `--replace`, since the
+  repositories created with it would no longer open.
+* A job may list `"hosts"`: it gets units only there — the jobs file is shared
+  between the systems of a dual boot, a system backup is not.
+
+```bash
+./install.sh --system                                   # once: the root-owned part
+M=/usr/local/lib/mirror-backup/mirror-backup
+op read … | sudo $M system set-key main                 # the repository password
+sudo $M system apply                                    # install ~/.config/backup-sync/system
+sudo $M system init backup-system                       # create the repository, once per job
+mirror-backup control backup-system start               # or the panel's start button
+```
+
+At login, `mirror-backup sync-units` warns (and notifies) when the edited system
+jobs differ from the installed ones. `mirror-backup-resume-system.service`
+restarts interrupted system runs at boot, like its user counterpart does at login.
 
 ## Panel indicators
 
@@ -157,6 +257,7 @@ gnome-extensions install --force backup-monitor@petronijus.zip
 ```bash
 ./install.sh                    # picks the panel for the desktop in use
 ./install.sh --desktop omarchy  # or say which: gnome | omarchy | none
+./install.sh --system           # also the root-owned part system jobs need (sudo)
 ```
 
 On GNOME, log out and in (Wayland) for a newly installed extension to appear;
@@ -200,7 +301,7 @@ The queue lock, PID and rsync progress files are per boot and stay local, in
 
 ```bash
 chmod +x uninstall.sh
-./uninstall.sh
+./uninstall.sh            # --system: the root-owned part too; /etc/mirror-backup (keys!) stays
 ```
 
 ## Manual Commands
@@ -212,15 +313,15 @@ mirror-backup status
 # Bring the units in line with jobs.json after editing it by hand
 mirror-backup sync-units
 
-# Run a backup now
-systemctl --user start backup-documents
+# Run, stop, pause, resume a job — of either scope (what the app and the panels call)
+mirror-backup control backup-documents start
+mirror-backup control backup-documents pause      # resume, stop
 
-# Stop a running backup
-systemctl --user stop backup-documents
+# What a restic job's next snapshot would add
+mirror-backup dry-run backup-home
 
-# Pause / resume
-systemctl --user kill --signal=USR1 backup-documents   # pause
-systemctl --user kill --signal=USR2 backup-documents   # resume
+# restic on a system job's repository (snapshots, ls, mount, restore — docs/restore.md)
+sudo /usr/local/lib/mirror-backup/mirror-backup system restic backup-system -- snapshots
 
 # Check timer schedule
 systemctl --user list-timers 'backup-*'
@@ -300,6 +401,15 @@ the one rsync stopped at even when it goes quiet on a slow mount.
 <destination>/.mirror-backup/history.jsonl            # run history
 <destination>/.mirror-backup/backup.log               # rsync log
 <destination>/.mirror-backup/deferred                 # marker: run postponed, restart at next start
+<destination>/.mirror-backup/maintenance.json         # restic: when prune and check last ran
+<destination>/repo/                                   # restic: the repository
+~/.config/backup-sync/system/                         # system jobs as edited (jobs.json, excludes, mounts/)
+/etc/mirror-backup/                                   # system jobs as installed, keys/, generated/
+/usr/local/lib/mirror-backup/                         # root-owned backup-sync, mirror-backup, app/, pre-commands
+/etc/systemd/system/backup-*.{service,timer}          # system units (generated)
+/etc/polkit-1/rules.d/50-mirror-backup.rules          # who may control them (generated)
+/etc/tmpfiles.d/mirror-backup.conf                    # /run/mirror-backup and the shared queue lock
+/run/mirror-backup/                                   # queue.lock (both scopes), system jobs' run files
 $XDG_RUNTIME_DIR/backup-sync/queue.lock               # job queue lock (this boot)
 $XDG_RUNTIME_DIR/backup-sync/<job>.{pid,progress}     # live run files (this boot)
 ~/.local/share/gnome-shell/extensions/backup-monitor@petronijus/   # GNOME panel
@@ -317,8 +427,13 @@ paths, status rules, unit generation, migration, resume), the Omarchy widget's
 formatting under node (`tests/test_omarchy_model.mjs`), and `backup-sync` end
 to end against throwaway directories (`tests/test_backup_sync.sh`: state in
 the destination, `--delete` sparing it, unmounted source and destination,
-empty source, scheduled runs covered or due). Nothing touches real backups,
-the desktop or systemd.
+empty source, scheduled runs covered or due, the shared queue, system scope,
+and restic against real throwaway repositories: snapshots, retention, copies,
+a missing repository, an unmounted listed path, unreadable files, the
+pre-command, the phases). `tests/test_restic_system.py` covers restic and
+system units, status wording, job loading, `control` routing and `system
+apply` (validation of what would run as root, the plan, the diff, keys).
+Nothing touches real backups, the desktop, systemd or /etc.
 
 ## Releases
 
