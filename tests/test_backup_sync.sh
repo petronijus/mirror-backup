@@ -104,6 +104,45 @@ check "mirror untouched" '[[ -f "$CASE/dst/a.txt" ]]'
 check "error status in the destination" '[[ $(json "$CASE/dst/.mirror-backup/status.json" "d[\"state\"]") == error ]]'
 : > "$BACKUP_SYNC_FSTAB"
 
+# ── network mounts: wait for the server first ──
+# A port nothing listens on, and a listener that comes up on it later. The
+# fstab entry's port= option points the probe there instead of NFS's 2049.
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+listen_later() {   # listen_later <delay> <port>: accepts until killed
+    python3 - "$@" <<'EOF' &
+import socket, sys, time
+time.sleep(float(sys.argv[1]))
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[2])))
+s.listen()
+while True:
+    s.accept()[0].close()
+EOF
+    LISTENER=$!
+}
+
+new_case unreachable-destination
+PORT=$(free_port)
+echo "127.0.0.1:/export $CASE/dst nfs defaults,port=$PORT 0 0" > "$BACKUP_SYNC_FSTAB"
+rc=$(BACKUP_SYNC_NETWORK_WAIT=1 run_sync)
+check "exits 1" '[[ $rc == 1 ]]'
+check "waited for the server" 'grep -q "waiting up to 1s for the network — 127.0.0.1 does not answer on port $PORT" "$CASE/out"'
+check "says which server" 'grep -q "Destination unreachable: 127.0.0.1 does not answer on port $PORT" "$CASE/out"'
+check "nothing written into the mount point" '[[ -z $(ls -A "$CASE/dst") ]]'
+: > "$BACKUP_SYNC_FSTAB"
+
+new_case server-comes-back
+PORT=$(free_port)
+echo "127.0.0.1:/export $CASE/src nfs4 defaults,port=$PORT 0 0" > "$BACKUP_SYNC_FSTAB"
+listen_later 2 "$PORT"
+rc=$(BACKUP_SYNC_NETWORK_WAIT=20 run_sync)
+kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
+check "waits until the server answers" 'grep -q "network is back" "$CASE/out"'
+# The server answers, but nothing is mounted at the test's mount point.
+check "then checks the mount as before" '[[ $rc == 1 ]] && grep -q "Source not mounted: $CASE/src" "$CASE/out"'
+: > "$BACKUP_SYNC_FSTAB"
+
 # ── empty source, full mirror ──
 new_case empty-source
 rc=$(run_sync)

@@ -579,18 +579,137 @@ wait_tick() {
     wait $! 2>/dev/null || true
 }
 
-# Networked source or destination (NFS, SMB, sshfs, rclone …)? Decided from
-# the mount table alone, so a server that is still unreachable cannot hang it.
-on_network_fs() {
-    local path fstype
-    for path in "$SRC" "$DST"; do
-        fstype=$(findmnt -n -o FSTYPE --target "$path" 2>/dev/null) || continue
-        case "$fstype" in
-            nfs|nfs4|cifs|smb3|ceph|glusterfs|9p|fuse.sshfs|fuse.rclone|fuse.s3fs|fuse.gcsfuse)
-                return 0 ;;
-        esac
+# --- networked source or destination (NFS, SMB, sshfs, rclone …) ---
+#
+# Timers with Persistent=true start a missed run right after boot or wake,
+# while the network is still coming up — and a suspend in the middle of a run
+# brings it back the same way. A run first waits until every server behind its
+# source and destination answers, at most NETWORK_WAIT seconds.
+
+NETWORK_WAIT="${BACKUP_SYNC_NETWORK_WAIT:-120}"
+DOWN_REASON=""
+
+# The filesystem behind each mount point: fstype, source and options, keyed by
+# mount point. The mount table wins, except where it holds only an automount
+# trap (autofs) — then fstab says what gets mounted there on first access.
+declare -A MNT_FSTYPE=() MNT_SOURCE=() MNT_OPTS=()
+load_mount_tables() {
+    local table target fstype source opts
+    local -a args
+    MNT_FSTYPE=() MNT_SOURCE=() MNT_OPTS=()
+    for table in fstab live; do
+        args=(-rn -o "TARGET,FSTYPE,SOURCE,OPTIONS")
+        [[ "$table" == fstab ]] && args=(-s ${BACKUP_SYNC_FSTAB:+-F "$BACKUP_SYNC_FSTAB"} "${args[@]}")
+        while read -r target fstype source opts; do
+            target=$(printf '%b' "$target")   # -r escapes blanks as \x20
+            [[ "$fstype" == autofs && -n "${MNT_FSTYPE[$target]:-}" ]] && continue
+            MNT_FSTYPE[$target]="$fstype"
+            MNT_SOURCE[$target]=$(printf '%b' "$source")
+            MNT_OPTS[$target]="$opts"
+        done < <(findmnt "${args[@]}" 2>/dev/null || true)
     done
+}
+
+# host[:…] or [v6-address][:…] → the bare host.
+host_of() {
+    if [[ "$1" == \[* ]]; then
+        local host="${1#\[}"
+        printf '%s\n' "${host%%\]*}"
+    else
+        printf '%s\n' "${1%%:*}"
+    fi
+}
+
+# What to probe for the mount at $1: "host port" for a server that can be
+# asked directly, "-" where only the network as a whole can be checked,
+# nothing for a local filesystem. A port= mount option overrides the default.
+probe_target() {
+    local source="${MNT_SOURCE[$1]}" opts=",${MNT_OPTS[$1]},"
+    local host port
+    case "${MNT_FSTYPE[$1]}" in
+        nfs|nfs4)         host=$(host_of "$source"); port=2049 ;;
+        cifs|smb3)        source="${source#//}"; host="${source%%/*}"; port=445 ;;
+        fuse.sshfs|sshfs) host=$(host_of "${source#*@}"); port=22 ;;
+        ceph|glusterfs|9p|fuse.rclone|fuse.s3fs|fuse.gcsfuse)
+            echo "-"; return ;;
+        *) return ;;
+    esac
+    if [[ "$opts" =~ ,port=([0-9]+), ]] && (( BASH_REMATCH[1] > 0 )); then
+        port="${BASH_REMATCH[1]}"
+    fi
+    echo "$host $port"
+}
+
+# Probe targets of the mounts on the way from the absolute path $1 up to /.
+probe_targets_along() {
+    local dir="$1"
+    while :; do
+        [[ -n "${MNT_FSTYPE[$dir]:-}" ]] && probe_target "$dir"
+        [[ "$dir" == / ]] && return 0
+        dir=$(dirname -- "$dir")
+    done
+}
+
+# Probe targets of the networked mounts behind path $1. The path is walked as
+# written first, without looking it up: below an automount point a lookup
+# starts the very mount that has to wait for the network. Only a path with no
+# networked mount on it as written is resolved — a symlink may lead onto one.
+network_servers() {
+    local targets
+    targets=$(probe_targets_along "$(realpath -s -m -- "$1")")
+    [[ -n "$targets" ]] || targets=$(probe_targets_along "$(realpath -m -- "$1")")
+    [[ -z "$targets" ]] || sort -u <<< "$targets"   # NFSv4 submounts repeat the server
+}
+
+# Does probe target "$1 [$2]" answer right now? Sets DOWN_REASON when not.
+reachable() {
+    if [[ "$1" == - ]]; then
+        command -v nm-online >/dev/null || return 0   # nothing to ask
+        nm-online -q -t 0 && return 0
+        DOWN_REASON="the network is offline"
+    else
+        timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null && return 0
+        DOWN_REASON="$1 does not answer on port $2"
+    fi
     return 1
+}
+
+# Does a server behind path $1 not answer? DOWN_REASON says which.
+unreachable() {
+    local target
+    load_mount_tables
+    while read -r target; do
+        # shellcheck disable=SC2086  # "host port" is two arguments
+        reachable $target </dev/null || return 0
+    done < <(network_servers "$1")
+    return 1
+}
+
+# Wait until every server behind the source and the destination answers.
+# Returns 1 at the deadline; the caller decides what a server still down means.
+wait_for_network() {
+    local deadline=$((SECONDS + NETWORK_WAIT)) waiting=0 target down
+    local -a targets
+    load_mount_tables
+    mapfile -t targets < <({ network_servers "$SRC"; network_servers "$DST"; } | sort -u)
+    while :; do
+        down=0
+        for target in "${targets[@]}"; do
+            # shellcheck disable=SC2086
+            reachable $target || { down=1; break; }
+        done
+        if (( ! down )); then
+            (( waiting )) && echo "$JOB_NAME: network is back" >&2
+            return 0
+        fi
+        (( SECONDS < deadline )) || return 1
+        if (( ! waiting )); then
+            echo "$JOB_NAME: waiting up to ${NETWORK_WAIT}s for the network — $DOWN_REASON" >&2
+            waiting=1
+        fi
+        wait_tick   # short ticks keep a Stop during the wait responsive
+        handle_signals
+    done
 }
 
 # Let the announced suspend proceed and return once the system is back.
@@ -600,10 +719,9 @@ wait_for_wake() {
         wait_tick   # short ticks keep a Stop during the wait responsive
         handle_signals
     done
-    # Right after wake the network is typically still reconnecting.
-    if on_network_fs && command -v nm-online >/dev/null; then
-        nm-online -q -t 60 || true
-    fi
+    # Right after wake the network is typically still reconnecting. A server
+    # still down then fails the rerun with rsync's own error.
+    wait_for_network || true
 }
 
 # Watch background child $1 until it exits, running $2 every tick. Returns 1
@@ -770,6 +888,10 @@ has_entries() {
         -print -quit 2>/dev/null)" ]]
 }
 
+# A server still down after the wait fails the run by name — rather than as a
+# mount that is missing or an automount that turns up empty.
+wait_for_network || true
+unreachable "$DST_DIR" && preflight_fail "Destination unreachable: $DOWN_REASON"
 require_mounted "$DST_DIR" || preflight_fail "Destination not mounted: $UNMOUNTED"
 # Never created here: a missing destination is a missing mount far more often
 # than a new job, and the app creates new destinations when it saves the job.
@@ -777,6 +899,7 @@ require_mounted "$DST_DIR" || preflight_fail "Destination not mounted: $UNMOUNTE
 mkdir -p "$STATE_DIR" 2>/dev/null || preflight_fail "Cannot write to the destination: $STATE_DIR"
 STATE_OK=1
 
+unreachable "$SRC" && preflight_fail "Source unreachable: $DOWN_REASON"
 require_mounted "$SRC" || preflight_fail "Source not mounted: $UNMOUNTED"
 [[ -d "$SRC" ]] || preflight_fail "Source not found: $SRC"
 if [[ "${BACKUP_SYNC_DELETE_MODE:-before}" != disabled ]] && ! has_entries "$SRC" \
