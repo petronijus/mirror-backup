@@ -1,16 +1,62 @@
 # Changelog
 
-All notable changes to Mirror Backup for GNOME. Format follows
+All notable changes to Mirror Backup. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/) (0.x = no stability promises).
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-11-23
+
+The project is no longer GNOME-only: it is **Mirror Backup** now (repository
+`petronijus/mirror-backup`, was `mirror-backup-gnome`). The GNOME Shell extension
+keeps its name and UUID; the release tarball is `mirror-backup-vX.Y.Z.tar.gz`.
+
+### Added
+- **One set of jobs for several machines.** A job's state (status, history, log)
+  lives in its destination, under `<destination>/.mirror-backup`, so every machine
+  or OS that mounts it sees the same state. A scheduled run is skipped when another
+  machine already covered that slot, and a run cut off by a crash or power loss is
+  restarted at the next login.
+- **`mirror-backup` command:** `status [--json|--watch]`, `sync-units`, `resume`
+  and `migrate-legacy`. The panels read their data from it.
+- **Omarchy support:** a bar widget, and the app follows the current Omarchy
+  theme, including theme switches.
+- **Backups survive suspend and shutdown.** A running rsync holds a sleep delay
+  inhibitor, stops cleanly when a suspend is announced and starts over after wake;
+  a run interrupted by shutdown is postponed (new "Postponed" state) and resumed at
+  the next start. This keeps rsync stuck on a FUSE mount (NTFS, rclone, sshfs) from
+  aborting a suspend.
+- **Progress through every phase of a run:** listing the source, the delete pass,
+  the comparison and pruning old archives, each with its own count and ETA. An
+  incremental run of a big mirror no longer sits at "Scanning 0 %".
+- **restic engine and system jobs:** a job can take restic snapshots instead of an
+  rsync mirror, and system jobs run as root from a root-owned copy
+  (`install.sh --system`, then `mirror-backup system apply`).
+- The GNOME panel indicator follows the tray icon position of Ubuntu's
+  AppIndicators extension.
+- GNOME Shell 51 support.
+
+### Changed
+- Before a run, backup-sync waits up to 120 s for the servers behind network
+  mounts (NFS, SMB, sshfs) to answer, so a missed run started right after boot or
+  wake no longer fails as "not mounted". A server still down fails the run by name.
+- Trash folders (`.Trash-<uid>`, `.Trash`, `$RECYCLE.BIN`) are never mirrored. A
+  trash a mirror already holds is left in place and has to be removed by hand.
+
 ### Fixed
-- Panel extension no longer ships a hardcoded list of job names — it now reads
-  the user's actual jobs from `~/.config/backup-sync/jobs.json` (same source as
-  the desktop app), so the panel reflects real jobs instead of a fixed set.
-- `uninstall.sh` removes whatever `backup-*` units exist instead of a fixed list.
-- Removed leftover personal job-name examples from README/comments.
+- The panel reads the user's own jobs from `jobs.json` instead of a hardcoded list
+  of job names; `uninstall.sh` removes whatever job units exist.
+- The archive no longer nests itself one level deeper on every run.
+- Status reads no longer get in the way of a suspend: `status --watch` and the app
+  pause while the system sleeps.
+- A job's state is kept out of `--delete`, and safety checks were added: a missing
+  destination is never created, mount points on the way to source and destination
+  must be mounted, and an empty source is refused while its mirror is not.
+- A job that mirrored millions of trashed files failed once the trash was emptied,
+  because rsync went past its 1 GiB memory limit deleting them in one pass.
+- The job detail page no longer crashes on history timestamps with an offset; a new
+  job keeps the exclude file created in the editor.
 
 ## [0.5.1] - 2026-06-13
 ### Changed
