@@ -127,6 +127,18 @@ class FakeLogind:
         poller.register(self._write_ends[index], select.POLLERR)
         return not poller.poll(0)
 
+    def released(self, index: int, timeout: float = 2.0) -> bool:
+        """Whether inhibitor ``index`` gets released within ``timeout`` seconds.
+        The client closing its descriptor is not enough on its own here: this
+        fake runs in the client's process, and the reply that carried the read
+        end keeps a copy of it until GDBus's worker thread frees the sent
+        message — asynchronously, sometimes after the client has already
+        closed its own. (The real logind is another process and has no such
+        copy.) So a release is waited for, not sampled."""
+        poller = select.poll()
+        poller.register(self._write_ends[index], select.POLLERR)
+        return bool(poller.poll(int(timeout * 1000)))
+
     def held_now(self) -> int:
         return sum(self.held(i) for i in range(len(self._write_ends)))
 
@@ -231,7 +243,7 @@ class GuardedReadTest(FakeBus):
         with sg.guarded_read('test', 'read', connection=self.conn, name=FAKE_NAME) as held:
             self.assertTrue(held)
             self.assertTrue(self.logind.held(0))
-        self.assertFalse(self.logind.held(0))
+        self.assertTrue(self.logind.released(0))
 
     def test_refused_during_a_suspend(self):
         self.logind.refuse = True
@@ -249,7 +261,7 @@ class GuardedReadTest(FakeBus):
         with self.assertRaises(OSError):
             with sg.guarded_read('test', 'read', connection=self.conn, name=FAKE_NAME):
                 raise OSError('destination went away')
-        self.assertFalse(self.logind.held(0))
+        self.assertTrue(self.logind.released(0))
 
 
 class StatusCommandTest(FakeBus):
@@ -276,7 +288,7 @@ class StatusCommandTest(FakeBus):
             self.assertEqual(cli.print_status(as_json=True), 0)
         self.assertEqual(self.reads, 1)
         self.assertEqual(len(self.logind.inhibits), 1)
-        self.assertFalse(self.logind.held(0))
+        self.assertTrue(self.logind.released(0))
 
     def test_reads_nothing_during_a_suspend(self):
         self.logind.refuse = True
@@ -343,7 +355,7 @@ class StatusWatchTest(FakeBus):
         glib_warnings = [str(w.message) for w in caught
                          if not issubclass(w.category, DeprecationWarning)]
         self.assertEqual(glib_warnings, [])
-        self.assertFalse(self.logind.held(0))
+        self.assertTrue(self.logind.released(0))
 
     def test_polls_on_without_logind(self):
         watch = cli.StatusWatch(self.out, guard_connection=self.conn, logind_name=ABSENT_NAME)

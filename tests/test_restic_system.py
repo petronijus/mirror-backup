@@ -229,8 +229,8 @@ class SystemApplyTest(SystemSandbox):
 
     def test_what_could_hurt_as_root_is_refused(self):
         bad = self.restic_job(
-            pre_command='/home/petr/evil.sh', exclude_file='../../etc/shadow', destination='/',
-            restic={'mode': 'backup', 'paths': ['relative/path'], 'password_file': '/home/petr/key',
+            pre_command='/home/user/evil.sh', exclude_file='../../etc/shadow', destination='/',
+            restic={'mode': 'backup', 'paths': ['relative/path'], 'password_file': '/home/user/key',
                     'keep': {'forever': 1}, 'check_subset': '5%; rm -rf /'})
         src = self.write_source([bad, self.copy_job(run_after='backup-missing')],
                                 **{'mounts__etc.mount': '[Mount]\nWhere=/etc\nWhat=/dev/sda1\n'})
