@@ -882,11 +882,14 @@ wait_for_network() {
             (( waiting )) && echo "$JOB_NAME: network is back" >&2
             return 0
         fi
-        (( SECONDS < deadline )) || return 1
+        # Said before the deadline is looked at: SECONDS counts whole seconds,
+        # so a first probe that crosses a second boundary can already meet a
+        # short deadline, and the log would never say what the run waited for.
         if (( ! waiting )); then
             echo "$JOB_NAME: waiting up to ${NETWORK_WAIT}s for the network — $DOWN_REASON" >&2
             waiting=1
         fi
+        (( SECONDS < deadline )) || return 1
         wait_tick   # short ticks keep a Stop during the wait responsive
         handle_signals
     done
