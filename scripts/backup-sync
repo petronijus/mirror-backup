@@ -1288,6 +1288,17 @@ run_rsync() {
         # alone. Unanchored, so another job's state inside the source (a job whose
         # destination lies within this one's source) is not mirrored either.
         --exclude=.mirror-backup/
+        # Trash is never backed up: what is in it was deleted on purpose. These are
+        # the trash folders a drive grows at its root — freedesktop's per-user
+        # .Trash-<uid> (gio trash) and shared .Trash, Windows' $RECYCLE.BIN —
+        # unanchored, for a mount nested inside the source too. An excluded path
+        # is protected from --delete, so a trash a mirror already holds stays
+        # there until removed by hand. (backup-fun once mirrored 2.6 M trashed
+        # files; deleting them all in one --delete-before pass took rsync past
+        # its 1 GiB --max-alloc and failed the run.)
+        --exclude=.Trash-[0-9]*/
+        --exclude=.Trash/
+        '--exclude=$RECYCLE.BIN/'
     )
 
     [[ -n "$DELETE_ARG" ]] && RSYNC_ARGS+=("$DELETE_ARG")

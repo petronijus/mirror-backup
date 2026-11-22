@@ -79,6 +79,23 @@ rc=$(run_sync)
 check "nested .mirror-backup of the source not copied" '[[ ! -e "$CASE/dst/sub/.mirror-backup" ]]'
 rm -rf "$CASE/src/.mirror-backup" "$CASE/src/sub/.mirror-backup"
 
+# ── trash is never mirrored, and a trash already in the mirror is left alone ──
+mkdir -p "$CASE/src/.Trash-1000/files" "$CASE/src/.Trash/1000" "$CASE/src/\$RECYCLE.BIN" \
+    "$CASE/src/sub/.Trash-1000/files" "$CASE/src/.Trash-notes"
+echo x > "$CASE/src/.Trash-1000/files/gone.txt"
+echo x > "$CASE/src/sub/.Trash-1000/files/gone.txt"
+echo x > "$CASE/src/.Trash/1000/gone.txt"
+echo x > "$CASE/src/\$RECYCLE.BIN/gone.txt"
+echo x > "$CASE/src/.Trash-notes/kept.txt"
+mkdir -p "$CASE/dst/.Trash-1000/files" && echo x > "$CASE/dst/.Trash-1000/files/old.txt"
+rc=$(run_sync)
+check "trash run exits 0" '[[ $rc == 0 ]]'
+check "no trash of the source copied" '[[ ! -e "$CASE/dst/.Trash-1000/files/gone.txt" && ! -e "$CASE/dst/sub/.Trash-1000" && ! -e "$CASE/dst/.Trash" && ! -e "$CASE/dst/\$RECYCLE.BIN" ]]'
+check "a folder only named like trash is copied" '[[ -f "$CASE/dst/.Trash-notes/kept.txt" ]]'
+check "trash already in the mirror is not deleted" '[[ -f "$CASE/dst/.Trash-1000/files/old.txt" ]]'
+rm -rf "$CASE/src/.Trash-1000" "$CASE/src/.Trash" "$CASE/src/\$RECYCLE.BIN" "$CASE/src/sub/.Trash-1000" \
+    "$CASE/src/.Trash-notes" "$CASE/dst/.Trash-1000"
+
 # ── missing destination: never created ──
 new_case missing-destination
 rmdir "$CASE/dst"
