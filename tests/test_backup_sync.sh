@@ -96,6 +96,67 @@ check "trash already in the mirror is not deleted" '[[ -f "$CASE/dst/.Trash-1000
 rm -rf "$CASE/src/.Trash-1000" "$CASE/src/.Trash" "$CASE/src/\$RECYCLE.BIN" "$CASE/src/sub/.Trash-1000" \
     "$CASE/src/.Trash-notes" "$CASE/dst/.Trash-1000"
 
+# ── exit 23: a disk error is an error, a file this user cannot read a warning ──
+mkdir -p "$TMP/bin23"
+cat > "$TMP/bin23/rsync" <<'EOF'
+#!/usr/bin/env bash
+# Stands in for an rsync that met errors: the lines of $RSYNC_ERRORS, then exit 23.
+printf '%s\n' "$RSYNC_ERRORS" >&2
+echo 'rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [sender=3.4.1]' >&2
+exit 23
+EOF
+chmod +x "$TMP/bin23/rsync"
+
+new_case storage-errors
+rc=$(PATH="$TMP/bin23:$PATH" RSYNC_ERRORS='rsync: [sender] readdir("/src/broken"): Input/output error (5)
+rsync: [sender] read errors mapping "/src/broken/a.flac": Input/output error (5)' run_sync)
+STATE="$CASE/dst/.mirror-backup"
+check "exits 23" '[[ $rc == 23 ]]'
+check "error status" '[[ $(json "$STATE/status.json" "d[\"state\"]") == error ]]'
+check "names the count and the first error" '[[ $(json "$STATE/status.json" "d[\"error\"]") == "2 file system errors, first: readdir(\"/src/broken\"): Input/output error (5)" ]]'
+check "history keeps the exit code" '[[ $(last_history "d[\"exit_code\"]") == 23 ]]'
+
+new_case unreadable-file
+rc=$(PATH="$TMP/bin23:$PATH" RSYNC_ERRORS='rsync: [sender] send_files failed to open "/src/locked": Permission denied (13)' run_sync)
+STATE="$CASE/dst/.mirror-backup"
+check "exits 0" '[[ $rc == 0 ]]'
+check "idle, with a warning" '[[ $(json "$STATE/status.json" "d[\"state\"] + \"|\" + d[\"error\"]") == "idle|Partial transfer (exit 23) — some files skipped" ]]'
+
+# ── a destination that takes no writes ──
+if (( EUID != 0 )); then   # root writes regardless of the mode bits
+    new_case unwritable-destination
+    rc=$(run_sync)
+    STATE="$CASE/dst/.mirror-backup"
+    chmod a-w "$STATE"
+    echo changed > "$CASE/src/a.txt"
+    rc=$(run_sync)
+    check "exits 1" '[[ $rc == 1 ]]'
+    check "says why" 'grep -q "Cannot write to the destination: $STATE" "$CASE/out"'
+    check "the mirror is untouched" '[[ $(cat "$CASE/dst/a.txt") == one ]]'
+    chmod u+w "$STATE"
+
+    # A read-only mount cannot be made without root; findmnt is asked, so a
+    # stand-in that reports one shows what the run says.
+    new_case read-only-destination
+    rc=$(run_sync)
+    STATE="$CASE/dst/.mirror-backup"
+    mkdir -p "$TMP/binro"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'case " $* " in'
+        echo '    *" -o OPTIONS -T "*) echo "ro,relatime,errors=remount-ro" ;;'
+        echo "    *\" -o TARGET -T \"*) echo \"$CASE/dst\" ;;"
+        echo '    *) exec /usr/bin/findmnt "$@" ;;'
+        echo 'esac'
+    } > "$TMP/binro/findmnt"
+    chmod +x "$TMP/binro/findmnt"
+    chmod a-w "$STATE"
+    rc=$(PATH="$TMP/binro:$PATH" run_sync)
+    check "exits 1" '[[ $rc == 1 ]]'
+    check "names the read-only file system" 'grep -q "Destination is on a read-only file system: $CASE/dst" "$CASE/out"'
+    chmod u+w "$STATE"
+fi
+
 # ── missing destination: never created ──
 new_case missing-destination
 rmdir "$CASE/dst"

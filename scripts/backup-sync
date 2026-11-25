@@ -1103,7 +1103,16 @@ require_mounted "$DST_DIR" || preflight_fail "Destination not mounted: $UNMOUNTE
 # Never created here: a missing destination is a missing mount far more often
 # than a new job, and the app creates new destinations when it saves the job.
 [[ -d "$DST_DIR" ]] || preflight_fail "Destination not found: $DST (not mounted?)"
-mkdir -p "$STATE_DIR" 2>/dev/null || preflight_fail "Cannot write to the destination: $STATE_DIR"
+# An existing state directory passes mkdir even on a read-only file system, so
+# writing is asked for. Before STATE_OK: a destination that takes no writes
+# cannot take the error status either — the readers see the read-only mount
+# for themselves (mounts.read_only_problem) instead of the last run's "ok".
+if ! mkdir -p "$STATE_DIR" 2>/dev/null || [[ ! -w "$STATE_DIR" ]]; then
+    if findmnt -n -o OPTIONS -T "$DST_DIR" 2>/dev/null | head -1 | tr ',' '\n' | grep -qx ro; then
+        preflight_fail "Destination is on a read-only file system: $(findmnt -n -o TARGET -T "$DST_DIR" | head -1)"
+    fi
+    preflight_fail "Cannot write to the destination: $STATE_DIR"
+fi
 STATE_OK=1
 
 # require_source <path>: reachable, every fstab mount on the way mounted, there.
@@ -1430,8 +1439,28 @@ run_rsync() {
 }
 
 # rsync's exit code into FINAL_STATE, ERROR_MSG, HISTORY_EXIT and ENGINE_EXIT.
+# The storage errors rsync met in this run, worded for the status: "N file
+# system errors, first: <rsync's line>"; nothing when there were none. These
+# are errors of the disk or file system — I/O error, read-only file system,
+# corruption, no space, quota — as opposed to a file that is locked or not
+# readable to this user, which leaves a run a warning (exit 23 either way).
+storage_errors_from_log() {
+    [[ -f "$LOG_FILE" ]] || return 0
+    awk -v marker="=== ${START_TIME} ===" '
+        !found { if (index($0, marker) == 1) found = 1; next }
+        /^rsync: / && /\((5|28|30|117|122)\)$/ {
+            if (!n++) { first = $0; sub(/^rsync: (\[[a-z]+\] )?/, "", first) }
+        }
+        END {
+            if (n) printf "%d file system error%s, first: %s\n", n, (n == 1 ? "" : "s"), first
+        }
+    ' "$LOG_FILE"
+}
+
 finish_rsync() {
-    if [[ "$RSYNC_EXIT" -eq 0 || "$RSYNC_EXIT" -eq 23 || "$RSYNC_EXIT" -eq 24 ]]; then
+    local storage=""
+    [[ "$RSYNC_EXIT" -eq 23 ]] && storage=$(storage_errors_from_log)
+    if [[ -z "$storage" ]] && [[ "$RSYNC_EXIT" -eq 0 || "$RSYNC_EXIT" -eq 23 || "$RSYNC_EXIT" -eq 24 ]]; then
         LAST_PCT=100
         CURRENT_FILE=""
         if [[ "$RSYNC_EXIT" -ne 0 ]]; then
@@ -1442,7 +1471,11 @@ finish_rsync() {
         HISTORY_EXIT=0  # tolerate 23/24 as success in history
         RSYNC_EXIT=0
     else
-        ERROR_MSG=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -v '^===' | head -3 | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//') || true
+        if [[ -n "$storage" ]]; then
+            ERROR_MSG=$storage
+        else
+            ERROR_MSG=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -v '^===' | head -3 | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//') || true
+        fi
         FINAL_STATE="error"
         HISTORY_EXIT="$RSYNC_EXIT"
         DIRS_SEEN=0   # a comparison cut short counted only part of them

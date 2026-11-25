@@ -21,7 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
-from backup_monitor import cli, desktop_theme, paths, units  # noqa: E402
+from backup_monitor import cli, desktop_theme, mounts, paths, units  # noqa: E402
 from backup_monitor.models.job import read_status  # noqa: E402
 from backup_monitor.models.job_history import last_run, read_history  # noqa: E402
 from backup_monitor.services import snapshot  # noqa: E402
@@ -405,6 +405,98 @@ class SnapshotTest(Sandbox):
     def test_unix_timestamps(self):
         self.assertTrue(snapshot._unix_to_iso('@1790758800').startswith('2026-09-30T'))
         self.assertEqual(snapshot._unix_to_iso(''), '')
+
+
+class ReadOnlyMountTest(Sandbox):
+    """A disk the kernel set read-only must not go on showing the last good run."""
+
+    def setUp(self):
+        super().setUp()
+        self.mountinfo = self.root / 'mountinfo'
+        self.fstab = self.root / 'fstab'
+        for var, path in (('MIRROR_BACKUP_MOUNTINFO', self.mountinfo), ('BACKUP_SYNC_FSTAB', self.fstab)):
+            patcher = mock.patch.dict(os.environ, {var: str(path)})
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fstab.write_text('UUID=5A4A  /mnt/data\\040disk  ntfs  rw,nofail  0 0\n'
+                              'UUID=9B2C  /mnt/snap  ext4  ro  0 0\n')
+
+    def mounts(self, *lines: str):
+        self.mountinfo.write_text(''.join(line + '\n' for line in lines))
+
+    # mount options rw, super block options ro: what errors=remount-ro leaves
+    FORCED = '40 30 8:1 / /mnt/data\\040disk rw,relatime shared:1 - ntfs /dev/sda1 ro,errors=remount-ro'
+    ROOT = '30 1 259:2 / / rw,relatime shared:2 - btrfs /dev/mapper/root rw'
+
+    def test_super_block_read_only_counts(self):
+        self.mounts(self.ROOT, self.FORCED)
+        m = mounts.mount_of('/mnt/data disk/Photos')
+        self.assertEqual((m.target, m.source, m.read_only), ('/mnt/data disk', '/dev/sda1', True))
+
+    def test_deepest_and_last_mount_wins(self):
+        self.mounts(self.ROOT, self.FORCED,
+                    '41 40 8:1 / /mnt/data\\040disk rw shared:3 - ntfs /dev/sda1 rw')
+        self.assertFalse(mounts.mount_of('/mnt/data disk/x').read_only)
+        self.assertEqual(mounts.mount_of('/mnt/data diskette').target, '/')
+
+    def test_destination_read_only_is_a_problem(self):
+        self.mounts(self.ROOT, self.FORCED)
+        problem = mounts.read_only_problem('/mnt/data disk/Photos', 'destination')
+        self.assertIn('Destination is on a read-only file system: /mnt/data disk (/dev/sda1)', problem)
+        self.assertIn('the kernel switched it', problem)
+
+    def test_source_only_when_fstab_says_read_write(self):
+        self.mounts(self.ROOT, self.FORCED,
+                    '50 30 8:2 / /mnt/snap ro shared:4 - ext4 /dev/sdb1 ro')
+        self.assertIn('Source is on a read-only', mounts.read_only_problem('/mnt/data disk/music', 'source'))
+        self.assertEqual(mounts.read_only_problem('/mnt/snap/x', 'source'), '')
+        self.assertIn('Destination is on a read-only',
+                      mounts.read_only_problem('/mnt/snap/x', 'destination'))
+
+    def test_writable_is_no_problem(self):
+        self.mounts(self.ROOT)
+        self.assertEqual(mounts.read_only_problem('/home/x', 'destination'), '')
+
+    def test_status_says_error_instead_of_the_last_good_run(self):
+        d = self.dest()
+        self.write_status(d, state='idle', progress=100)
+        self.mounts(self.ROOT, f'60 30 8:1 / {d} rw - ntfs /dev/sda1 ro')
+        st = read_status(str(d))
+        self.assertEqual(st.state, 'error')
+        self.assertIn('Destination is on a read-only file system', st.error)
+
+    def test_never_ran_destination_read_only_is_error_too(self):
+        d = self.dest()
+        self.mounts(self.ROOT, f'60 30 8:1 / {d} rw - ntfs /dev/sda1 ro')
+        self.assertEqual(read_status(str(d)).state, 'error')
+
+    def test_forced_read_only_source_makes_the_job_an_error(self):
+        d = self.dest()
+        self.write_status(d, state='idle', progress=100)
+        self.mounts(self.ROOT, self.FORCED)
+        st = read_status(str(d), source='/mnt/data disk/music/')
+        self.assertEqual(st.state, 'error')
+        self.assertIn('Source is on a read-only file system', st.error)
+        self.assertEqual(read_status(str(d)).state, 'idle')   # no source given: not looked at
+
+    def test_live_run_keeps_its_state(self):
+        proc = subprocess.Popen(['bash', '-c', 'exec -a backup-sync sleep 30'])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        time.sleep(0.2)
+        d = self.dest()
+        self.write_status(d, state='running', pid=proc.pid, boot_id=BOOT)
+        self.mounts(self.ROOT, f'60 30 8:1 / {d} rw - ntfs /dev/sda1 ro')
+        self.assertEqual(read_status(str(d)).state, 'running')
+
+    def test_snapshot_checks_an_rsync_jobs_source_only(self):
+        d = self.dest()
+        self.write_status(d, state='idle', progress=100)
+        self.mounts(self.ROOT, self.FORCED)
+        rsync_job = self.job(dest=d, source='/mnt/data disk/music/')
+        restic_job = self.job('backup-sys', dest=d, source='/mnt/data disk/paths', engine='restic')
+        snap = snapshot.snapshot([rsync_job, restic_job], timers={})
+        self.assertEqual([j['status']['state'] for j in snap['jobs']], ['error', 'idle'])
 
 
 if __name__ == '__main__':

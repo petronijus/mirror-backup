@@ -63,7 +63,10 @@ def _unix_to_iso(value: str) -> str:
 
 def job_snapshot(job: dict, timers: dict[str, dict], boot: str) -> dict:
     destination = job.get('destination', '')
-    status = read_status(destination, current_boot=boot)
+    # An rsync job reads its source directly; a restic job's source is a list
+    # of paths, each checked by restic itself.
+    source = job.get('source', '') if units.job_engine(job) == 'rsync' else ''
+    status = read_status(destination, current_boot=boot, source=source)
     entry = last_run(destination) if status.state != 'unavailable' else None
     timer = timers.get(job['id'], {})
     return {

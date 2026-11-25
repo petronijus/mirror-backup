@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from backup_monitor import paths
+from backup_monitor import mounts, paths
 
 ACTIVE_STATES = ('running', 'scanning', 'paused', 'queued')
 
@@ -154,7 +154,8 @@ class BackupStatus:
         }
 
 
-def read_status(destination: str, *, current_boot: str | None = None) -> BackupStatus:
+def read_status(destination: str, *, current_boot: str | None = None,
+                source: str = '') -> BackupStatus:
     """The status of the job mirroring into ``destination``.
 
     The file is shared by every machine that mounts the destination, so an
@@ -167,6 +168,9 @@ def read_status(destination: str, *, current_boot: str | None = None) -> BackupS
       that ran it went down; ``mirror-backup resume`` restarts it
     * active, this boot, dead    → ``error``: the process ended without
       writing a final status (SIGKILL, OOM)
+    * not active, and the destination on a read-only file system, or the
+      ``source`` (an rsync job's) read-only though fstab mounts it read-write
+      → ``error``, whatever the file says (see mounts.read_only_problem)
     """
     job = paths.job_paths(destination)
     if not job.available:
@@ -175,7 +179,7 @@ def read_status(destination: str, *, current_boot: str | None = None) -> BackupS
     try:
         data = json.loads(job.status.read_text())
     except FileNotFoundError:
-        return BackupStatus()
+        return _read_only_check(BackupStatus(), destination, source)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
         return BackupStatus(state='error', error=f'Unreadable status file: {e}')
 
@@ -216,6 +220,23 @@ def read_status(destination: str, *, current_boot: str | None = None) -> BackupS
             _clear_progress(st)
             st.state = 'error'
             st.error = 'Backup process ended unexpectedly'
+    return _read_only_check(st, destination, source)
+
+
+def _read_only_check(st: BackupStatus, destination: str, source: str) -> BackupStatus:
+    """A job whose destination, or whose source, sits on a file system that
+    is read-only against its will cannot run — and a read-only destination
+    cannot even record the failure, so its status file would go on showing
+    the last good run. That is an error now, not at the next run. A live run
+    keeps its state: it fails, and says so, by itself."""
+    if st.state in ACTIVE_STATES:
+        return st
+    problem = mounts.read_only_problem(destination, 'destination')
+    if not problem and source:
+        problem = mounts.read_only_problem(source, 'source')
+    if problem:
+        st.state = 'error'
+        st.error = problem
     return st
 
 
@@ -276,7 +297,8 @@ class BackupJob:
     timer_schedule: str = ''
 
     def read_status(self) -> BackupStatus:
-        self.status = read_status(self.destination)
+        self.status = read_status(self.destination,
+                                  source=self.source if self.engine == 'rsync' else '')
         return self.status
 
     @staticmethod

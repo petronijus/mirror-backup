@@ -5,6 +5,15 @@ All notable changes to Mirror Backup. Format follows
 [SemVer](https://semver.org/) (0.x = no stability promises).
 
 ## [Unreleased]
+### Changed
+- A run that meets disk errors (I/O error, read-only file system, corruption, no
+  space, quota) now fails and names them. Files that are locked or unreadable to the
+  user stay a warning.
+
+### Fixed
+- A job whose destination is on a read-only file system, or whose source the kernel
+  switched to read-only, is shown as an error with the reason instead of its last
+  good run; a run refuses a destination it cannot write to.
 
 ## [0.6.0] - 2026-11-23
 
@@ -53,8 +62,8 @@ keeps its name and UUID; the release tarball is `mirror-backup-vX.Y.Z.tar.gz`.
 - A job's state is kept out of `--delete`, and safety checks were added: a missing
   destination is never created, mount points on the way to source and destination
   must be mounted, and an empty source is refused while its mirror is not.
-- A job that mirrored millions of trashed files failed once the trash was emptied,
-  because rsync went past its 1 GiB memory limit deleting them in one pass.
+- A job whose mirror held millions of trashed files failed with rsync's 1 GiB memory
+  limit on the run that had to delete them; leaving trash out avoids such runs.
 - The job detail page no longer crashes on history timestamps with an offset; a new
   job keeps the exclude file created in the editor.
 
